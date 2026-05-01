@@ -1,0 +1,1738 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>ai-bridge-server 测试台</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --bg: #1a1a1a;
+      --bg-2: #232323;
+      --panel: #1e1e1e;
+      --panel-2: #2a2a2a;
+      --border: #333;
+      --border-light: #404040;
+      --text: #d4d4d4;
+      --text-dim: #888;
+      --text-faint: #666;
+      --accent: #c084fc;       /* purple */
+      --accent-2: #a855f7;
+      --user: #5fa8d3;
+      --tool: #d4a373;
+      --thinking: #888;
+      --ok: #4ec9b0;
+      --warn: #dcdcaa;
+      --err: #f48771;
+      --code-bg: #0d0d0d;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden; }
+    body {
+      font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    button {
+      font: inherit;
+      color: var(--text);
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 4px 10px;
+      cursor: pointer;
+    }
+    button:hover { background: var(--border); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+    button.primary:hover { background: var(--accent-2); }
+    button.danger { background: var(--err); border-color: var(--err); color: white; }
+    button.icon-btn { padding: 4px 8px; background: transparent; border-color: transparent; }
+    button.icon-btn:hover { background: var(--panel-2); border-color: var(--border); }
+    input, textarea {
+      font: inherit;
+      color: var(--text);
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 6px 8px;
+      width: 100%;
+    }
+    input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+    .app {
+      height: 100vh;
+      display: grid;
+      grid-template-rows: 44px 1fr;
+      grid-template-columns: 1fr;
+    }
+
+    /* ============ TOP BAR ============ */
+    .topbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 14px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+    }
+    .topbar h1 {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .topbar .spacer { flex: 1; }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+    .dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--text-faint);
+      box-shadow: 0 0 4px var(--text-faint);
+    }
+    .dot.ok { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+    .dot.err { background: var(--err); box-shadow: 0 0 6px var(--err); }
+    .dot.warn { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+
+    .topbar .baseurl {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+      width: 220px;
+      padding: 3px 8px;
+    }
+
+    /* ============ MAIN LAYOUT ============ */
+    .body {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      min-height: 0;
+    }
+    .body.no-sidebar { grid-template-columns: 0 1fr; }
+    .body.no-sidebar .sidebar { display: none; }
+
+    /* ============ SIDEBAR (历史) ============ */
+    .sidebar {
+      background: var(--panel);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .sidebar-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .sidebar-header .spacer { flex: 1; }
+    .sidebar-content { overflow-y: auto; flex: 1; padding: 4px 0; }
+    .sidebar-section { padding: 6px 0; }
+    .sidebar-section .label {
+      padding: 4px 12px;
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--text-faint);
+    }
+    .session-item, .project-item {
+      padding: 6px 12px;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      border-left: 2px solid transparent;
+    }
+    .session-item:hover, .project-item:hover { background: var(--bg-2); }
+    .session-item.active, .project-item.active {
+      background: var(--bg-2);
+      border-left-color: var(--accent);
+    }
+    .session-item .title {
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .session-item .meta { font-size: 10px; color: var(--text-faint); }
+    .project-item .name {
+      font-size: 11px;
+      color: var(--text-dim);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .project-item.active .name { color: var(--text); }
+    .empty-tip {
+      padding: 12px;
+      color: var(--text-faint);
+      font-size: 11px;
+      text-align: center;
+    }
+
+    /* ============ CHAT AREA ============ */
+    .chat-area {
+      display: grid;
+      grid-template-rows: 1fr auto;
+      min-height: 0;
+      background: var(--bg);
+    }
+    .messages {
+      overflow-y: auto;
+      padding: 20px;
+      scroll-behavior: smooth;
+    }
+    .messages-empty {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: var(--text-faint);
+    }
+    .messages-empty .logo {
+      font-size: 48px;
+      margin-bottom: 8px;
+      animation: spin 4s linear infinite;
+      display: inline-block;
+    }
+    @keyframes spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+    .messages-empty .ver-pill {
+      display: inline-block;
+      padding: 1px 7px;
+      background: rgba(192, 132, 252, 0.15);
+      border: 1px solid var(--accent);
+      border-radius: 9px;
+      font-size: 10px;
+      color: var(--accent);
+      margin-left: 4px;
+    }
+    .messages-empty .hint {
+      margin-top: 12px;
+      font-size: 12px;
+    }
+    .messages-empty .session-info {
+      margin-top: 6px;
+      font-size: 10px;
+      font-family: ui-monospace, monospace;
+      color: var(--text-faint);
+    }
+
+    .msg {
+      max-width: 880px;
+      margin: 0 auto 14px;
+      animation: fadeIn 0.2s;
+    }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+    .msg-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 4px;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+    .role-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 1px 7px;
+      border-radius: 9px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.4px;
+    }
+    .role-tag.user { background: rgba(95, 168, 211, 0.15); color: var(--user); }
+    .role-tag.assistant { background: rgba(192, 132, 252, 0.15); color: var(--accent); }
+    .role-tag.system { background: rgba(220, 220, 170, 0.12); color: var(--warn); }
+    .msg-body {
+      padding: 10px 14px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .msg.user .msg-body { background: var(--bg-2); }
+    .msg .timestamp { font-size: 10px; color: var(--text-faint); }
+    .msg .model { font-size: 10px; color: var(--text-faint); }
+
+    /* tool use card */
+    .tool-card {
+      margin: 8px 0;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--tool);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .tool-card .head {
+      padding: 6px 10px;
+      background: rgba(212, 163, 115, 0.08);
+      font-size: 11px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .tool-card .head .arrow { color: var(--text-faint); transition: transform 0.15s; }
+    .tool-card.open .head .arrow { transform: rotate(90deg); }
+    .tool-card .name { color: var(--tool); font-weight: 600; }
+    .tool-card .id { color: var(--text-faint); font-family: ui-monospace, monospace; font-size: 10px; }
+    .tool-card .body {
+      padding: 8px 10px;
+      display: none;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+      max-height: 320px;
+      overflow: auto;
+    }
+    .tool-card.open .body { display: block; }
+    .tool-card pre { margin: 0; white-space: pre-wrap; word-break: break-all; }
+    .tool-result-card {
+      margin: 4px 0 8px;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--ok);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .tool-result-card .head {
+      padding: 6px 10px;
+      background: rgba(78, 201, 176, 0.06);
+      font-size: 11px;
+      cursor: pointer;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .tool-result-card.open .head .arrow { transform: rotate(90deg); }
+    .tool-result-card .body {
+      padding: 8px 10px;
+      display: none;
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      max-height: 320px;
+      overflow: auto;
+    }
+    .tool-result-card.open .body { display: block; }
+
+    /* thinking */
+    .thinking-card {
+      margin: 8px 0;
+      background: rgba(136, 136, 136, 0.05);
+      border: 1px dashed var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .thinking-card .head {
+      padding: 6px 10px;
+      font-size: 11px;
+      cursor: pointer;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      color: var(--thinking);
+    }
+    .thinking-card.open .head .arrow { transform: rotate(90deg); }
+    .thinking-card .body {
+      padding: 8px 10px;
+      display: none;
+      color: var(--thinking);
+      font-style: italic;
+      max-height: 320px;
+      overflow: auto;
+    }
+    .thinking-card.open .body { display: block; }
+
+    /* streaming cursor */
+    .stream-cursor::after {
+      content: '▍';
+      color: var(--accent);
+      animation: blink 1s step-end infinite;
+      margin-left: 2px;
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+
+    /* ============ INPUT ============ */
+    .composer {
+      border-top: 1px solid var(--border);
+      background: var(--panel);
+      padding: 10px 16px;
+    }
+    .composer-inner {
+      max-width: 880px;
+      margin: 0 auto;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-2);
+      transition: border-color 0.2s;
+    }
+    .composer-inner:focus-within { border-color: var(--accent); }
+    .composer textarea {
+      border: 0;
+      background: transparent;
+      resize: none;
+      min-height: 44px;
+      max-height: 240px;
+      padding: 10px 12px;
+      width: 100%;
+      font-family: inherit;
+    }
+    .composer-tools {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 8px 6px;
+      border-top: 1px solid var(--border);
+    }
+    .composer-tools .spacer { flex: 1; }
+    .composer-tools select {
+      background: transparent;
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: 11px;
+    }
+    .send-btn {
+      background: var(--accent);
+      color: white;
+      border: 0;
+      border-radius: 4px;
+      padding: 4px 12px;
+    }
+    .send-btn:hover { background: var(--accent-2); }
+    .composer .hint {
+      max-width: 880px;
+      margin: 6px auto 0;
+      font-size: 10px;
+      color: var(--text-faint);
+    }
+
+    /* ============ DEBUG OVERLAY ============ */
+    .debug-overlay {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      max-height: 50vh;
+      background: var(--panel);
+      border-top: 1px solid var(--border);
+      transform: translateY(calc(100% - 28px));
+      transition: transform 0.2s;
+      display: flex;
+      flex-direction: column;
+      z-index: 50;
+    }
+    .debug-overlay.open { transform: translateY(0); }
+    .debug-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 4px 14px;
+      cursor: pointer;
+      background: var(--panel-2);
+      border-bottom: 1px solid var(--border);
+      font-size: 11px;
+      user-select: none;
+    }
+    .debug-bar .arrow { transition: transform 0.2s; }
+    .debug-overlay.open .debug-bar .arrow { transform: rotate(180deg); }
+    .debug-tabs {
+      display: flex;
+      gap: 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .debug-tab {
+      padding: 6px 14px;
+      background: transparent;
+      border: 0;
+      border-right: 1px solid var(--border);
+      border-radius: 0;
+      cursor: pointer;
+      color: var(--text-dim);
+      font-size: 11px;
+    }
+    .debug-tab.active { color: var(--text); background: var(--bg); }
+    .debug-content {
+      flex: 1;
+      overflow: auto;
+      padding: 8px 14px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+    }
+    .debug-content[data-tab=raw] { display: none; }
+    .debug-content[data-tab=raw].active { display: block; }
+    .debug-content[data-tab=send] { display: none; }
+    .debug-content[data-tab=send].active { display: block; }
+    .log-line { padding: 1px 0; word-break: break-all; }
+    .log-line.send { color: var(--user); }
+    .log-line.recv { color: var(--text); }
+    .log-line.info { color: var(--text-dim); }
+    .log-line.err  { color: var(--err); }
+    .log-line .ts { color: var(--text-faint); margin-right: 6px; }
+
+    .send-form { display: flex; flex-direction: column; gap: 8px; }
+    .send-form select, .send-form textarea, .send-form input { font-family: ui-monospace, monospace; font-size: 11px; }
+    .send-form .row { display: flex; gap: 8px; align-items: center; }
+    .send-form textarea { min-height: 80px; }
+
+    /* ============ MODAL (permission/ask/plan) ============ */
+    .modal-stack {
+      position: fixed;
+      top: 60px;
+      right: 16px;
+      width: 380px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      z-index: 100;
+      pointer-events: none;
+    }
+    .modal {
+      pointer-events: all;
+      background: var(--panel);
+      border: 1px solid var(--warn);
+      border-radius: 6px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+      animation: slideIn 0.2s;
+    }
+    @keyframes slideIn { from { transform: translateX(20px); opacity: 0; } to { transform: none; opacity: 1; } }
+    .modal.resolved { border-color: var(--ok); opacity: 0.6; }
+    .modal .head {
+      padding: 8px 12px;
+      background: rgba(220, 220, 170, 0.08);
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--warn);
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .modal.resolved .head { background: rgba(78, 201, 176, 0.08); color: var(--ok); }
+    .modal .body { padding: 10px 12px; font-size: 12px; max-height: 240px; overflow: auto; }
+    .modal .actions { padding: 8px 12px; border-top: 1px solid var(--border); display: flex; gap: 6px; flex-wrap: wrap; }
+    .modal pre { margin: 6px 0; padding: 6px; background: var(--code-bg); border-radius: 3px; font-size: 11px; max-height: 100px; overflow: auto; }
+    .modal small { color: var(--text-faint); font-size: 10px; }
+
+    /* helpers */
+    .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  </style>
+</head>
+<body>
+
+<div class="app">
+  <!-- ============ TOP BAR ============ -->
+  <div class="topbar">
+    <button id="btnToggleSidebar" class="icon-btn" title="切换侧栏">☰</button>
+    <h1>ai-bridge-server 测试台</h1>
+    <span class="status-pill">
+      <span class="dot" id="dotServer"></span>
+      <span id="serverStatus">未连接</span>
+    </span>
+    <span class="status-pill">
+      <span class="dot" id="dotSession"></span>
+      <span id="sessionStatus">无会话</span>
+    </span>
+    <span class="status-pill">
+      <span class="dot" id="dotSse"></span>
+      <span id="sseStatus">SSE 未连接</span>
+    </span>
+    <span class="spacer"></span>
+    <input class="baseurl mono" id="baseUrl" value="http://localhost:3284" />
+    <button class="icon-btn" id="btnReconnect" title="重连服务">↻</button>
+    <button class="icon-btn" id="btnNewSession" title="新会话">+ 新会话</button>
+  </div>
+
+  <!-- ============ MAIN BODY ============ -->
+  <div class="body" id="body">
+    <!-- LEFT SIDEBAR: 历史 -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <span>历史会话</span>
+        <span class="spacer"></span>
+        <button class="icon-btn" id="btnRefreshHist" title="刷新">↻</button>
+      </div>
+      <div class="sidebar-content" id="sidebarContent">
+        <div class="empty-tip">点击 ↻ 加载历史</div>
+      </div>
+    </aside>
+
+    <!-- MAIN CHAT -->
+    <main class="chat-area">
+      <div class="messages" id="messages">
+        <div class="messages-empty" id="emptyState">
+          <div class="logo">✦</div>
+          <div><span style="font-weight:500;">给 Claude Code 发送消息</span><span class="ver-pill" id="verPill">v?</span></div>
+          <div class="hint" id="emptyHint">正在自动建立会话…</div>
+          <div class="session-info" id="emptySession"></div>
+        </div>
+      </div>
+
+      <div class="composer">
+        <div class="composer-inner">
+          <textarea id="composer" placeholder="给 Claude Code 发送消息  (Enter 发送，Shift+Enter 换行)"></textarea>
+          <div class="composer-tools">
+            <select id="modelSelect" title="model（留空走默认）">
+              <option value="">默认 model</option>
+              <option value="claude-sonnet-4-5">claude-sonnet-4-5</option>
+              <option value="claude-opus-4-1">claude-opus-4-1</option>
+              <option value="claude-haiku-4-5">claude-haiku-4-5</option>
+            </select>
+            <select id="permModeSelect" title="permissionMode">
+              <option value="default">default</option>
+              <option value="acceptEdits">acceptEdits</option>
+              <option value="bypassPermissions">bypassPermissions</option>
+              <option value="plan">plan</option>
+            </select>
+            <input class="mono" id="cwdInput" placeholder="cwd（默认当前 server 进程 cwd）" style="width: 320px; font-size: 11px; padding: 2px 6px;" />
+            <span class="spacer"></span>
+            <button class="send-btn" id="btnSend">发送 ↵</button>
+          </div>
+        </div>
+        <div class="hint" id="modeHint">• 实时模式：消息发到当前 session，daemon 流式返回</div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- ============ MODAL STACK (permission/ask/plan) ============ -->
+<div class="modal-stack" id="modalStack"></div>
+
+<!-- ============ DEBUG OVERLAY ============ -->
+<div class="debug-overlay" id="debugOverlay">
+  <div class="debug-bar" id="debugBar">
+    <span class="arrow">▲</span>
+    <span>调试面板</span>
+    <span class="spacer"></span>
+    <span class="status-pill"><span id="debugSendCount">0</span> sent</span>
+    <span class="status-pill"><span id="debugRecvCount">0</span> events</span>
+    <span class="status-pill">last-id: <span id="debugLastId">-</span></span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="btnClearDebug">清空</button>
+  </div>
+  <div class="debug-tabs">
+    <button class="debug-tab active" data-tab="raw">SSE 原始流</button>
+    <button class="debug-tab" data-tab="send">手动发送</button>
+  </div>
+  <div class="debug-content active" data-tab="raw" id="debugRaw"></div>
+  <div class="debug-content" data-tab="send" id="debugSend">
+    <div class="send-form">
+      <div class="row">
+        <select id="presetSelect">
+          <option value="custom">自定义</option>
+          <option value="heartbeat">heartbeat</option>
+          <option value="abort">abort</option>
+          <option value="status">status</option>
+          <option value="claude.send">claude.send</option>
+          <option value="claude.getMcpServerStatus">claude.getMcpServerStatus</option>
+          <option value="claude.resetRuntime">claude.resetRuntime</option>
+          <option value="codex.send">codex.send</option>
+          <option value="shutdown">shutdown</option>
+        </select>
+        <button id="btnRawSend">POST /in</button>
+      </div>
+      <textarea id="rawBody" spellcheck="false"></textarea>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  // =================================================================
+  // STATE
+  // =================================================================
+  const state = {
+    baseUrl: '',
+    sessionId: null,
+    pid: null,
+    eventSource: null,
+    lastEventId: 0,
+    sendCount: 0,
+    recvCount: 0,
+    serverVersion: null,
+
+    /** @type {'live'|'history'} */
+    mode: 'live',
+
+    /** Live mode: in-flight assistant message being streamed */
+    streamingMsg: null,
+
+    /** Active history session being viewed */
+    activeHistorySession: null,
+    activeProject: null,
+
+    /** Pending _ctrl modals */
+    modals: new Map(),
+  };
+
+  // =================================================================
+  // DOM
+  // =================================================================
+  const $ = (id) => document.getElementById(id);
+  const $$ = (sel) => document.querySelectorAll(sel);
+
+  // =================================================================
+  // UTILS
+  // =================================================================
+  function escapeHtml(s) {
+    return String(s ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  function fmtTime(t) {
+    if (!t) return '';
+    const d = typeof t === 'number' ? new Date(t) : new Date(t);
+    if (isNaN(d.getTime())) return '';
+    const now = Date.now();
+    const diff = now - d.getTime();
+    if (diff < 60_000) return '刚刚';
+    if (diff < 3600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+    if (diff < 86400_000) return `${Math.floor(diff / 3600_000)} 小时前`;
+    if (diff < 30 * 86400_000) return `${Math.floor(diff / 86400_000)} 天前`;
+    return d.toLocaleDateString();
+  }
+  function setDot(id, cls) { $(id).className = 'dot' + (cls ? ' ' + cls : ''); }
+
+  function debug(type, msg) {
+    const el = $('debugRaw');
+    const div = document.createElement('div');
+    div.className = `log-line ${type}`;
+    const ts = new Date().toLocaleTimeString();
+    div.innerHTML = `<span class="ts">${ts}</span>${escapeHtml(msg)}`;
+    el.appendChild(div);
+    el.scrollTop = el.scrollHeight;
+    while (el.children.length > 600) el.removeChild(el.firstChild);
+  }
+
+  // =================================================================
+  // API
+  // =================================================================
+  async function apiFetch(method, path, body, opts = {}) {
+    const url = state.baseUrl + path;
+    debug('send', `${method} ${path}` + (body !== undefined ? ' ' + JSON.stringify(body).slice(0, 200) : ''));
+    state.sendCount++;
+    $('debugSendCount').textContent = state.sendCount;
+    try {
+      const init = { method };
+      if (body !== undefined) {
+        init.headers = { 'Content-Type': 'application/json' };
+        init.body = typeof body === 'string' ? body : JSON.stringify(body);
+      }
+      if (opts.headers) init.headers = { ...(init.headers || {}), ...opts.headers };
+      const res = await fetch(url, init);
+      const text = await res.text();
+      let data;
+      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+      if (!res.ok) debug('err', `${res.status} ${path}: ${text.slice(0, 200)}`);
+      return { ok: res.ok, status: res.status, data, text };
+    } catch (e) {
+      debug('err', `${method} ${path}: ${e.message}`);
+      return { ok: false, error: e.message };
+    }
+  }
+
+  // =================================================================
+  // SERVER + SESSION LIFECYCLE
+  // =================================================================
+  async function checkServer() {
+    state.baseUrl = $('baseUrl').value.replace(/\/$/, '');
+    localStorage.setItem('ai-bridge-base-url', $('baseUrl').value);
+    setDot('dotServer', 'warn');
+    $('serverStatus').textContent = '检查中…';
+    const r = await apiFetch('GET', '/health');
+    if (!r.ok) {
+      setDot('dotServer', 'err');
+      $('serverStatus').textContent = '不可达';
+      $('emptyHint').textContent = '服务不可达，请检查 Base URL';
+      return false;
+    }
+    setDot('dotServer', 'ok');
+    $('serverStatus').textContent = '在线';
+    const v = await apiFetch('GET', '/version');
+    if (v.ok && v.data) {
+      state.serverVersion = v.data.version;
+      $('verPill').textContent = `v${v.data.version}`;
+    }
+    return true;
+  }
+
+  async function newSession() {
+    closeSse();
+    if (state.sessionId) {
+      await apiFetch('DELETE', `/session/${state.sessionId}`);
+    }
+    state.sessionId = null;
+    state.pid = null;
+    state.streamingMsg = null;
+    setDot('dotSession', 'warn');
+    $('sessionStatus').textContent = '创建中…';
+    $('emptyHint').textContent = '正在创建会话…';
+
+    const r = await apiFetch('POST', '/session');
+    if (!r.ok) {
+      setDot('dotSession', 'err');
+      $('sessionStatus').textContent = '创建失败';
+      $('emptyHint').textContent = `创建会话失败：${r.error || r.status}`;
+      return;
+    }
+    state.sessionId = r.data.sessionId;
+    state.pid = r.data.pid;
+    state.lastEventId = 0;
+    setDot('dotSession', 'ok');
+    $('sessionStatus').textContent = `${state.sessionId.slice(0, 8)} (pid=${state.pid})`;
+    $('emptySession').textContent = `session: ${state.sessionId} · pid: ${state.pid}`;
+    $('emptyHint').textContent = '会话已就绪，请在下方输入消息';
+
+    enterLiveMode();
+    openSse();
+  }
+
+  function openSse() {
+    if (!state.sessionId) return;
+    if (state.eventSource) closeSse();
+    setDot('dotSse', 'warn');
+    $('sseStatus').textContent = 'SSE 连接中…';
+    const url = state.baseUrl + `/session/${state.sessionId}/events`;
+    const es = new EventSource(url);
+    state.eventSource = es;
+
+    es.onopen = () => {
+      setDot('dotSse', 'ok');
+      $('sseStatus').textContent = 'SSE 已连接';
+    };
+    es.onmessage = (ev) => {
+      state.recvCount++;
+      $('debugRecvCount').textContent = state.recvCount;
+      if (ev.lastEventId) {
+        state.lastEventId = parseInt(ev.lastEventId, 10) || state.lastEventId;
+        $('debugLastId').textContent = state.lastEventId;
+      }
+      debug('recv', ev.data);
+      let parsed;
+      try { parsed = JSON.parse(ev.data); } catch { return; }
+      handleSse(parsed);
+    };
+    es.onerror = () => {
+      setDot('dotSse', 'err');
+      $('sseStatus').textContent = 'SSE 异常（自动重连）';
+    };
+  }
+
+  function closeSse() {
+    if (state.eventSource) {
+      try { state.eventSource.close(); } catch {}
+      state.eventSource = null;
+    }
+    setDot('dotSse', '');
+    $('sseStatus').textContent = 'SSE 未连接';
+  }
+
+  // =================================================================
+  // SSE EVENT ROUTER
+  // =================================================================
+  function handleSse(msg) {
+    if (msg.type === 'daemon') {
+      handleDaemonEvent(msg);
+      return;
+    }
+    if (msg.type === '_ctrl') {
+      handleCtrlMessage(msg);
+      return;
+    }
+    if (msg.id) {
+      handleRequestOutput(msg);
+      return;
+    }
+  }
+
+  function handleDaemonEvent(msg) {
+    if (msg.event === 'ready') {
+      // already shown via /version
+    } else if (msg.event === 'shutdown') {
+      $('sseStatus').textContent = `SSE 已断开 (${msg.reason || 'shutdown'})`;
+    }
+  }
+
+  function handleRequestOutput(msg) {
+    // Live streaming: parse the daemon's tagged lines
+    if (msg.line) {
+      parseStreamLine(msg.id, msg.line);
+    } else if (msg.stderr) {
+      // server-side daemon stderr — debug only
+    } else if (msg.done) {
+      finalizeStreaming(msg.success);
+    } else if (msg.type === 'heartbeat') {
+      // ignore
+    }
+  }
+
+  // =================================================================
+  // STREAM LINE PARSER (daemon tagged NDJSON inner format)
+  // =================================================================
+  // The daemon emits lines like:
+  //   [STREAM_START]
+  //   [CONTENT_BLOCK_START] type=text
+  //   [CONTENT_DELTA] "Hello"
+  //   [CONTENT_BLOCK_END]
+  //   [TOOL_USE_START] name=Bash id=toolu_xxx
+  //   [TOOL_USE_INPUT_DELTA] {"command":"..."}
+  //   [TOOL_USE_END]
+  //   [THINKING_DELTA] "..."
+  //   [STREAM_END]
+  // Plus older-format raw text. We're lenient: known tags update structured
+  // state; unknown lines append to a "raw" tail.
+  function parseStreamLine(reqId, line) {
+    if (!state.streamingMsg || state.streamingMsg.reqId !== reqId) {
+      // Echo of user message has already been added by us in send(); anything
+      // else creates a fresh assistant bubble.
+      state.streamingMsg = createStreamingAssistant(reqId);
+    }
+    const m = state.streamingMsg;
+
+    // Tagged line format
+    const tagMatch = line.match(/^\[([A-Z_]+)\](?:\s+(.*))?$/s);
+    if (tagMatch) {
+      const tag = tagMatch[1];
+      const rest = tagMatch[2] || '';
+      onStreamTag(m, tag, rest);
+      return;
+    }
+    // Untagged line — append as plain text to the most recent text block (or tail)
+    appendText(m, line + '\n');
+  }
+
+  function onStreamTag(m, tag, rest) {
+    switch (tag) {
+      case 'STREAM_START':
+        // already created the assistant bubble
+        break;
+
+      case 'CONTENT_BLOCK_START': {
+        // close previous block, start a new one
+        finalizeBlock(m);
+        const params = parseTagParams(rest);
+        m.currentBlock = { kind: params.type || 'text', el: null, text: '' };
+        break;
+      }
+      case 'CONTENT_BLOCK_END':
+        finalizeBlock(m);
+        break;
+
+      case 'CONTENT_DELTA': {
+        const text = parseQuoted(rest);
+        appendText(m, text);
+        break;
+      }
+      case 'CONTENT': {
+        // full message content (non-streaming mode)
+        const text = parseQuoted(rest);
+        appendText(m, text);
+        break;
+      }
+      case 'THINKING_START':
+        finalizeBlock(m);
+        m.currentBlock = { kind: 'thinking', el: null, text: '' };
+        break;
+      case 'THINKING_DELTA':
+      case 'THINKING':
+        ensureThinking(m);
+        appendText(m, parseQuoted(rest));
+        break;
+
+      case 'TOOL_USE_START': {
+        finalizeBlock(m);
+        const params = parseTagParams(rest);
+        m.currentBlock = {
+          kind: 'tool_use',
+          name: params.name || 'Tool',
+          id: params.id || '',
+          input: '',
+          el: null,
+        };
+        renderToolUse(m);
+        break;
+      }
+      case 'TOOL_USE': {
+        // Single-line summary form: [TOOL_USE] {"id":"...","name":"..."}
+        finalizeBlock(m);
+        let info = {};
+        try { info = JSON.parse(rest); } catch {}
+        m.currentBlock = {
+          kind: 'tool_use',
+          name: info.name || 'Tool',
+          id: info.id || '',
+          input: info.input ? JSON.stringify(info.input) : '',
+          el: null,
+        };
+        renderToolUse(m);
+        if (m.currentBlock.input) updateToolUseBody(m.currentBlock);
+        finalizeBlock(m);
+        break;
+      }
+      case 'TOOL_USE_INPUT_DELTA':
+      case 'TOOL_INPUT_DELTA': {
+        if (m.currentBlock && m.currentBlock.kind === 'tool_use') {
+          m.currentBlock.input += rest;
+          updateToolUseBody(m.currentBlock);
+        }
+        break;
+      }
+      case 'TOOL_USE_END':
+      case 'TOOL_USE_INPUT_END':
+        finalizeBlock(m);
+        break;
+
+      case 'STREAM_END':
+        finalizeBlock(m);
+        break;
+
+      case 'USAGE': {
+        try {
+          const u = JSON.parse(rest);
+          m.usage = u;
+          updateMsgFooter(m);
+        } catch {}
+        break;
+      }
+
+      case 'MESSAGE_START': {
+        try {
+          const meta = JSON.parse(rest);
+          if (meta?.message?.model) {
+            m.model = meta.message.model;
+            updateMsgFooter(m);
+          }
+        } catch {}
+        break;
+      }
+      case 'MESSAGE':
+      case 'MESSAGE_END':
+      case 'SESSION_ID':
+      case 'TOOL_RESULT':
+        // Already handled via streaming tags / not user-facing for this UI
+        break;
+
+      default:
+        // Unknown tag — show as a faint debug line
+        appendText(m, `\n[${tag}] ${rest}\n`);
+    }
+    scrollMessagesToBottom();
+  }
+
+  function parseTagParams(s) {
+    const out = {};
+    const re = /(\w+)=("([^"]*)"|([^\s]+))/g;
+    let mm;
+    while ((mm = re.exec(s)) !== null) {
+      out[mm[1]] = mm[3] !== undefined ? mm[3] : mm[4];
+    }
+    return out;
+  }
+  function parseQuoted(s) {
+    s = s.trim();
+    if (s.startsWith('"') && s.endsWith('"')) {
+      try { return JSON.parse(s); } catch {}
+      return s.slice(1, -1);
+    }
+    return s;
+  }
+
+  function ensureThinking(m) {
+    if (!m.currentBlock || m.currentBlock.kind !== 'thinking') {
+      finalizeBlock(m);
+      m.currentBlock = { kind: 'thinking', el: null, text: '' };
+    }
+  }
+
+  function appendText(m, text) {
+    if (!m.currentBlock) {
+      m.currentBlock = { kind: 'text', el: null, text: '' };
+    }
+    if (m.currentBlock.kind === 'text') {
+      m.currentBlock.text += text;
+      ensureTextEl(m);
+      m.currentBlock.el.textContent = m.currentBlock.text;
+    } else if (m.currentBlock.kind === 'thinking') {
+      m.currentBlock.text += text;
+      ensureThinkingEl(m);
+      const body = m.currentBlock.el.querySelector('.body');
+      body.textContent = m.currentBlock.text;
+    }
+  }
+
+  function ensureTextEl(m) {
+    if (m.currentBlock.el) return;
+    const span = document.createElement('span');
+    span.className = 'text-block stream-cursor';
+    m.contentEl.appendChild(span);
+    m.currentBlock.el = span;
+  }
+  function ensureThinkingEl(m) {
+    if (m.currentBlock.el) return;
+    const card = document.createElement('div');
+    card.className = 'thinking-card';
+    card.innerHTML = `
+      <div class="head"><span class="arrow">▶</span><span>💭 Thinking</span></div>
+      <div class="body"></div>
+    `;
+    card.querySelector('.head').onclick = () => card.classList.toggle('open');
+    m.contentEl.appendChild(card);
+    m.currentBlock.el = card;
+  }
+
+  function renderToolUse(m) {
+    const blk = m.currentBlock;
+    const card = document.createElement('div');
+    card.className = 'tool-card';
+    card.innerHTML = `
+      <div class="head">
+        <span class="arrow">▶</span>
+        <span>🔧</span>
+        <span class="name">${escapeHtml(blk.name)}</span>
+        <span class="id">${escapeHtml(blk.id)}</span>
+      </div>
+      <div class="body"><pre></pre></div>
+    `;
+    card.querySelector('.head').onclick = () => card.classList.toggle('open');
+    m.contentEl.appendChild(card);
+    blk.el = card;
+  }
+  function updateToolUseBody(blk) {
+    if (!blk.el) return;
+    const pre = blk.el.querySelector('pre');
+    let display = blk.input;
+    try {
+      const parsed = JSON.parse(blk.input);
+      display = JSON.stringify(parsed, null, 2);
+    } catch {}
+    pre.textContent = display;
+  }
+
+  function finalizeBlock(m) {
+    if (!m.currentBlock) return;
+    if (m.currentBlock.kind === 'text' && m.currentBlock.el) {
+      m.currentBlock.el.classList.remove('stream-cursor');
+    }
+    m.currentBlock = null;
+  }
+
+  function finalizeStreaming(success) {
+    if (!state.streamingMsg) return;
+    finalizeBlock(state.streamingMsg);
+    if (!success) {
+      const err = document.createElement('div');
+      err.className = 'log-line err';
+      err.style.marginTop = '6px';
+      err.textContent = '⚠ 请求未成功完成';
+      state.streamingMsg.contentEl.appendChild(err);
+    }
+    state.streamingMsg = null;
+  }
+
+  // =================================================================
+  // MESSAGES UI
+  // =================================================================
+  function clearMessages() {
+    $('messages').innerHTML = `
+      <div class="messages-empty" id="emptyState">
+        <div class="logo">✦</div>
+        <div><span style="font-weight:500;">给 Claude Code 发送消息</span><span class="ver-pill" id="verPill">v${state.serverVersion || '?'}</span></div>
+        <div class="hint" id="emptyHint">${state.sessionId ? '会话已就绪，请在下方输入消息' : '正在自动建立会话…'}</div>
+        <div class="session-info" id="emptySession">${state.sessionId ? `session: ${state.sessionId} · pid: ${state.pid}` : ''}</div>
+      </div>
+    `;
+  }
+
+  function ensureMessagesNotEmpty() {
+    const empty = $('emptyState');
+    if (empty) empty.remove();
+  }
+
+  function appendMessageBubble(role, opts = {}) {
+    ensureMessagesNotEmpty();
+    const wrap = document.createElement('div');
+    wrap.className = `msg ${role}`;
+    const header = document.createElement('div');
+    header.className = 'msg-header';
+    header.innerHTML = `
+      <span class="role-tag ${role}">${role === 'user' ? '👤 用户' : role === 'assistant' ? '✦ 助手' : '⚙️ 系统'}</span>
+      ${opts.timestamp ? `<span class="timestamp">${escapeHtml(fmtTime(opts.timestamp))}</span>` : ''}
+      ${opts.model ? `<span class="model">${escapeHtml(opts.model)}</span>` : ''}
+      <span class="usage-slot"></span>
+    `;
+    const body = document.createElement('div');
+    body.className = 'msg-body';
+    wrap.appendChild(header);
+    wrap.appendChild(body);
+    $('messages').appendChild(wrap);
+    return { wrap, header, contentEl: body };
+  }
+
+  function createStreamingAssistant(reqId) {
+    const { wrap, header, contentEl } = appendMessageBubble('assistant', { timestamp: Date.now() });
+    return {
+      reqId,
+      wrap,
+      header,
+      contentEl,
+      currentBlock: null,
+      blocks: [],
+      model: null,
+      usage: null,
+    };
+  }
+
+  function updateMsgFooter(m) {
+    const slot = m.header.querySelector('.usage-slot');
+    if (!slot) return;
+    let html = '';
+    if (m.model) html += ` <span class="model">${escapeHtml(m.model)}</span>`;
+    if (m.usage) {
+      const u = m.usage;
+      html += ` <span class="model">in:${u.input_tokens || 0} out:${u.output_tokens || 0}</span>`;
+    }
+    slot.innerHTML = html;
+  }
+
+  function scrollMessagesToBottom() {
+    const m = $('messages');
+    m.scrollTop = m.scrollHeight;
+  }
+
+  // =================================================================
+  // _CTRL MODAL HANDLING
+  // =================================================================
+  function handleCtrlMessage(msg) {
+    if (msg.action === 'gateway_error') {
+      showGatewayError(msg);
+      return;
+    }
+    if (
+      msg.action === 'permission_request' ||
+      msg.action === 'ask_user_question_request' ||
+      msg.action === 'plan_approval_request'
+    ) {
+      renderModal(msg);
+    }
+  }
+
+  function showGatewayError(msg) {
+    const el = document.createElement('div');
+    el.className = 'modal';
+    el.style.borderColor = 'var(--err)';
+    el.innerHTML = `
+      <div class="head" style="color: var(--err); background: rgba(244,135,113,0.08);">⚠ gateway_error <small>(${escapeHtml(msg.code || '')})</small></div>
+      <div class="body"><pre>${escapeHtml(msg.message || '')}</pre></div>
+      <div class="actions"><button class="primary close-btn">关闭</button></div>
+    `;
+    el.querySelector('.close-btn').onclick = () => el.remove();
+    $('modalStack').appendChild(el);
+  }
+
+  function renderModal(msg) {
+    state.modals.set(msg.requestId, msg);
+    const el = document.createElement('div');
+    el.className = 'modal';
+    el.dataset.requestId = msg.requestId;
+
+    let title, body, actions;
+    if (msg.action === 'permission_request') {
+      title = `权限请求：${escapeHtml(msg.toolName || '?')}`;
+      const inputs = JSON.stringify(msg.inputs || {}, null, 2);
+      body = `<div><strong>cwd</strong>: <span class="mono">${escapeHtml(msg.cwd || '')}</span></div><pre>${escapeHtml(inputs)}</pre>`;
+      actions = `<button class="primary" data-allow="true">允许</button><button class="danger" data-allow="false">拒绝</button>`;
+    } else if (msg.action === 'ask_user_question_request') {
+      const q = (msg.questions || [{}])[0] || {};
+      title = '询问用户';
+      body = `<div>${escapeHtml(q.question || JSON.stringify(q))}</div>
+        <input class="answer" placeholder="自由输入..." style="margin-top:8px;" />`;
+      const opts = Array.isArray(q.options) ? q.options : [];
+      actions = '';
+      opts.forEach((o) => {
+        const v = typeof o === 'string' ? o : (o.label || o.value || '');
+        actions += `<button data-opt="${escapeHtml(v)}">${escapeHtml(v)}</button>`;
+      });
+      actions += `<button class="primary" data-submit="1">提交</button>`;
+    } else if (msg.action === 'plan_approval_request') {
+      title = 'Plan 审批';
+      body = `<div><strong>计划：</strong></div><pre>${escapeHtml(msg.plan || '')}</pre>`;
+      actions = `<button class="primary" data-approve="true">批准</button><button class="danger" data-approve="false">拒绝</button>`;
+    }
+
+    el.innerHTML = `
+      <div class="head">⏳ ${title} <small>(${escapeHtml(msg.requestId)})</small></div>
+      <div class="body">${body}</div>
+      <div class="actions">${actions}</div>
+    `;
+
+    el.querySelectorAll('button[data-allow]').forEach((b) => {
+      b.onclick = () => sendCtrlResponse(el, msg.requestId, 'permission_response', { allow: b.dataset.allow === 'true' });
+    });
+    el.querySelectorAll('button[data-opt]').forEach((b) => {
+      b.onclick = () => { el.querySelector('.answer').value = b.dataset.opt; };
+    });
+    el.querySelectorAll('button[data-submit]').forEach((b) => {
+      b.onclick = () => {
+        const v = el.querySelector('.answer').value;
+        sendCtrlResponse(el, msg.requestId, 'ask_user_question_response', { answers: [v] });
+      };
+    });
+    el.querySelectorAll('button[data-approve]').forEach((b) => {
+      b.onclick = () => sendCtrlResponse(el, msg.requestId, 'plan_approval_response', {
+        approved: b.dataset.approve === 'true',
+        editedPlan: null,
+      });
+    });
+
+    $('modalStack').appendChild(el);
+  }
+
+  async function sendCtrlResponse(el, requestId, action, extra) {
+    await postIn({ type: '_ctrl', action, requestId, ...extra });
+    el.classList.add('resolved');
+    el.querySelector('.head').innerHTML = `✓ ${action} <small>(${escapeHtml(requestId)})</small>`;
+    el.querySelectorAll('button, input').forEach((x) => x.disabled = true);
+    setTimeout(() => el.remove(), 2500);
+    state.modals.delete(requestId);
+  }
+
+  // =================================================================
+  // SEND MESSAGE
+  // =================================================================
+  async function postIn(body) {
+    if (!state.sessionId) {
+      debug('err', '尚未建立 session');
+      return { ok: false };
+    }
+    return await apiFetch('POST', `/session/${state.sessionId}/in`, body);
+  }
+
+  async function send() {
+    const text = $('composer').value.trim();
+    if (!text) return;
+    if (!state.sessionId) {
+      alert('Session 未就绪');
+      return;
+    }
+
+    enterLiveMode();
+
+    // Render user bubble immediately
+    const { contentEl } = appendMessageBubble('user', { timestamp: Date.now() });
+    contentEl.textContent = text;
+
+    $('composer').value = '';
+    autoResize($('composer'));
+
+    const reqId = `r-${Date.now().toString(36)}`;
+    const params = {
+      message: text,
+      cwd: $('cwdInput').value.trim() || undefined,
+      permissionMode: $('permModeSelect').value || 'default',
+      sessionId: state.activeHistorySession || '',
+    };
+    const model = $('modelSelect').value;
+    if (model) params.model = model;
+
+    const body = { id: reqId, method: 'claude.send', params };
+    await postIn(body);
+    scrollMessagesToBottom();
+  }
+
+  function autoResize(textarea) {
+    textarea.style.height = 'auto';
+    textarea.style.height = Math.min(240, textarea.scrollHeight) + 'px';
+  }
+
+  // =================================================================
+  // HISTORY
+  // =================================================================
+  async function loadHistory() {
+    const sb = $('sidebarContent');
+    sb.innerHTML = `<div class="empty-tip">加载中…</div>`;
+    const r = await apiFetch('GET', '/history/projects');
+    if (!r.ok) {
+      sb.innerHTML = `<div class="empty-tip">加载失败：${escapeHtml(r.error || r.status)}</div>`;
+      return;
+    }
+    const projects = r.data || [];
+    if (!projects.length) {
+      sb.innerHTML = `<div class="empty-tip">暂无历史项目<br><small>~/.claude/projects 为空</small></div>`;
+      return;
+    }
+    sb.innerHTML = '';
+    for (const p of projects) {
+      const item = document.createElement('div');
+      item.className = 'project-item';
+      item.dataset.encodedPath = p.encodedPath;
+      item.innerHTML = `
+        <div class="name truncate" title="${escapeHtml(p.displayPath)}">${escapeHtml(p.displayPath)}</div>
+        <div class="meta" style="font-size:10px;color:var(--text-faint);">${p.sessionCount} 会话 · ${fmtTime(p.mtime)}</div>
+      `;
+      item.onclick = () => openProject(p, item);
+      sb.appendChild(item);
+    }
+  }
+
+  async function openProject(p, itemEl) {
+    $$('.project-item').forEach((el) => el.classList.remove('active'));
+    itemEl.classList.add('active');
+    state.activeProject = p;
+
+    // remove any existing session list under this project
+    let listEl = itemEl.nextElementSibling;
+    while (listEl && listEl.classList.contains('session-list')) {
+      const next = listEl.nextElementSibling;
+      listEl.remove();
+      listEl = next;
+    }
+
+    listEl = document.createElement('div');
+    listEl.className = 'session-list sidebar-section';
+    listEl.innerHTML = `<div class="empty-tip">加载会话中…</div>`;
+    itemEl.after(listEl);
+
+    const r = await apiFetch('GET', `/history/sessions?project=${encodeURIComponent(p.encodedPath)}&limit=50`);
+    if (!r.ok) {
+      listEl.innerHTML = `<div class="empty-tip">加载失败</div>`;
+      return;
+    }
+    const sessions = r.data || [];
+    if (!sessions.length) {
+      listEl.innerHTML = `<div class="empty-tip">无会话</div>`;
+      return;
+    }
+    listEl.innerHTML = '';
+    for (const s of sessions) {
+      const it = document.createElement('div');
+      it.className = 'session-item';
+      it.dataset.sessionId = s.sessionId;
+      it.innerHTML = `
+        <div class="title" title="${escapeHtml(s.title || '')}">${escapeHtml(s.title || '(无标题)')}</div>
+        <div class="meta">${escapeHtml(s.sessionId.slice(0, 8))} · ${fmtTime(s.lastTurnTime || s.startTime)}${s.model ? ' · ' + escapeHtml(s.model) : ''}</div>
+      `;
+      it.onclick = () => openHistorySession(p, s, it);
+      listEl.appendChild(it);
+    }
+  }
+
+  async function openHistorySession(p, s, itemEl) {
+    $$('.session-item').forEach((el) => el.classList.remove('active'));
+    itemEl.classList.add('active');
+    state.activeHistorySession = s.sessionId;
+    state.mode = 'history';
+    closeSse();
+    $('modeHint').textContent = `• 历史模式：浏览旧会话 ${s.sessionId.slice(0, 8)}（点击 + 新会话 回到实时模式）`;
+
+    clearMessages();
+    ensureMessagesNotEmpty();
+    const banner = document.createElement('div');
+    banner.style.cssText = 'max-width:880px;margin:0 auto 14px;padding:8px 12px;background:var(--bg-2);border:1px dashed var(--border-light);border-radius:6px;font-size:11px;color:var(--text-dim);';
+    banner.innerHTML = `📜 历史会话 <span class="mono">${escapeHtml(s.sessionId)}</span> · ${escapeHtml(p.displayPath)} · ${escapeHtml(s.title || '')}`;
+    $('messages').appendChild(banner);
+
+    const url = state.baseUrl + `/history/session?project=${encodeURIComponent(p.encodedPath)}&sessionId=${encodeURIComponent(s.sessionId)}`;
+    debug('send', `GET /history/session sid=${s.sessionId}`);
+    let text;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        debug('err', `历史读取失败 ${res.status}`);
+        return;
+      }
+      text = await res.text();
+    } catch (e) {
+      debug('err', `历史读取异常 ${e.message}`);
+      return;
+    }
+    const lines = text.split('\n').filter((l) => l.trim());
+    debug('info', `历史 jsonl 共 ${lines.length} 行`);
+
+    let lastModel = '';
+    for (const line of lines) {
+      let obj;
+      try { obj = JSON.parse(line); } catch { continue; }
+      renderHistoryEntry(obj, lastModel);
+      if (obj?.message?.model) lastModel = obj.message.model;
+    }
+    scrollMessagesToBottom();
+  }
+
+  function renderHistoryEntry(obj, lastModel) {
+    if (!obj) return;
+    const type = obj.type || obj.message?.role || 'system';
+    if (type === 'summary' || obj.isMeta) return;
+
+    if (type === 'user') {
+      renderHistoryUser(obj);
+    } else if (type === 'assistant') {
+      renderHistoryAssistant(obj, lastModel);
+    } else {
+      // unknown: render as compact info
+      const div = document.createElement('div');
+      div.className = 'msg system';
+      div.innerHTML = `
+        <div class="msg-header"><span class="role-tag system">${escapeHtml(type)}</span></div>
+        <div class="msg-body mono" style="font-size:11px;">${escapeHtml(JSON.stringify(obj).slice(0, 500))}</div>
+      `;
+      $('messages').appendChild(div);
+    }
+  }
+
+  function renderHistoryUser(obj) {
+    const content = obj.message?.content;
+    // Tool results in user content → render as result card under the previous assistant
+    if (Array.isArray(content)) {
+      const toolResults = content.filter((c) => c?.type === 'tool_result');
+      const texts = content.filter((c) => c?.type !== 'tool_result');
+      if (toolResults.length && !texts.length) {
+        // Pure tool result(s) → render as cards in their own bubble (or attach to last)
+        for (const tr of toolResults) renderToolResultCard(tr);
+        return;
+      }
+      const text = texts.map(extractText).filter(Boolean).join('\n').trim();
+      if (text) {
+        const { contentEl } = appendMessageBubble('user', { timestamp: obj.timestamp });
+        contentEl.textContent = text;
+      }
+      for (const tr of toolResults) renderToolResultCard(tr);
+      return;
+    }
+    if (typeof content === 'string') {
+      const { contentEl } = appendMessageBubble('user', { timestamp: obj.timestamp });
+      contentEl.textContent = content;
+    }
+  }
+
+  function renderHistoryAssistant(obj, lastModel) {
+    const model = obj.message?.model || lastModel || '';
+    const usage = obj.message?.usage || null;
+    const { contentEl, header } = appendMessageBubble('assistant', {
+      timestamp: obj.timestamp,
+    });
+    if (model) {
+      const slot = header.querySelector('.usage-slot');
+      slot.innerHTML = `<span class="model">${escapeHtml(model)}</span>`;
+      if (usage) {
+        slot.innerHTML += ` <span class="model">in:${usage.input_tokens || 0} out:${usage.output_tokens || 0}</span>`;
+      }
+    }
+    const content = obj.message?.content;
+    if (typeof content === 'string') {
+      contentEl.textContent = content;
+      return;
+    }
+    if (Array.isArray(content)) {
+      for (const block of content) renderAssistantBlock(block, contentEl);
+    }
+  }
+
+  function renderAssistantBlock(block, parent) {
+    if (!block) return;
+    if (block.type === 'text') {
+      const span = document.createElement('span');
+      span.className = 'text-block';
+      span.textContent = block.text || '';
+      parent.appendChild(span);
+    } else if (block.type === 'thinking') {
+      const card = document.createElement('div');
+      card.className = 'thinking-card';
+      card.innerHTML = `
+        <div class="head"><span class="arrow">▶</span><span>💭 Thinking</span></div>
+        <div class="body"></div>
+      `;
+      card.querySelector('.head').onclick = () => card.classList.toggle('open');
+      card.querySelector('.body').textContent = block.thinking || block.text || '';
+      parent.appendChild(card);
+    } else if (block.type === 'tool_use') {
+      const card = document.createElement('div');
+      card.className = 'tool-card';
+      let inputDisplay = '';
+      try { inputDisplay = JSON.stringify(block.input || {}, null, 2); }
+      catch { inputDisplay = String(block.input || ''); }
+      card.innerHTML = `
+        <div class="head">
+          <span class="arrow">▶</span>
+          <span>🔧</span>
+          <span class="name">${escapeHtml(block.name || 'Tool')}</span>
+          <span class="id">${escapeHtml(block.id || '')}</span>
+        </div>
+        <div class="body"><pre></pre></div>
+      `;
+      card.querySelector('.head').onclick = () => card.classList.toggle('open');
+      card.querySelector('pre').textContent = inputDisplay;
+      parent.appendChild(card);
+    } else {
+      const div = document.createElement('div');
+      div.className = 'mono';
+      div.style.cssText = 'font-size:11px;color:var(--text-faint);';
+      div.textContent = `[${block.type}] ${JSON.stringify(block).slice(0, 200)}`;
+      parent.appendChild(div);
+    }
+  }
+
+  function renderToolResultCard(tr) {
+    // Attach as standalone card (could also append to previous assistant message)
+    ensureMessagesNotEmpty();
+    const wrap = document.createElement('div');
+    wrap.className = 'msg';
+    wrap.style.maxWidth = '880px';
+    wrap.style.margin = '0 auto 8px';
+    let body = tr.content;
+    if (Array.isArray(body)) {
+      body = body.map(extractText).join('\n');
+    } else if (typeof body !== 'string') {
+      body = JSON.stringify(body, null, 2);
+    }
+    const card = document.createElement('div');
+    card.className = 'tool-result-card';
+    card.innerHTML = `
+      <div class="head">
+        <span class="arrow">▶</span>
+        <span>↳ tool_result</span>
+        <span class="id mono">${escapeHtml(tr.tool_use_id || '')}</span>
+      </div>
+      <div class="body"><pre></pre></div>
+    `;
+    card.querySelector('.head').onclick = () => card.classList.toggle('open');
+    card.querySelector('pre').textContent = body || '';
+    wrap.appendChild(card);
+    $('messages').appendChild(wrap);
+  }
+
+  function extractText(c) {
+    if (!c) return '';
+    if (typeof c === 'string') return c;
+    if (typeof c.text === 'string') return c.text;
+    if (Array.isArray(c.content)) return c.content.map(extractText).join('\n');
+    return '';
+  }
+
+  function enterLiveMode() {
+    if (state.mode === 'live') return;
+    state.mode = 'live';
+    state.activeHistorySession = null;
+    $$('.session-item').forEach((el) => el.classList.remove('active'));
+    $('modeHint').textContent = '• 实时模式：消息发到当前 session，daemon 流式返回';
+  }
+
+  // =================================================================
+  // PRESETS (debug send)
+  // =================================================================
+  const presets = {
+    custom: '',
+    heartbeat: () => JSON.stringify({ id: rid(), method: 'heartbeat' }),
+    abort: () => JSON.stringify({ id: rid(), method: 'abort' }),
+    status: () => JSON.stringify({ id: rid(), method: 'status' }),
+    shutdown: () => JSON.stringify({ id: rid(), method: 'shutdown' }),
+    'claude.send': () => JSON.stringify({
+      id: rid(), method: 'claude.send',
+      params: { message: 'Say hi briefly.', cwd: '', permissionMode: 'default' }
+    }, null, 2),
+    'claude.getMcpServerStatus': () => JSON.stringify({
+      id: rid(), method: 'claude.getMcpServerStatus', params: {}
+    }, null, 2),
+    'claude.resetRuntime': () => JSON.stringify({
+      id: rid(), method: 'claude.resetRuntime', params: {}
+    }, null, 2),
+    'codex.send': () => JSON.stringify({
+      id: rid(), method: 'codex.send',
+      params: { message: 'Say hi.', cwd: '' }
+    }, null, 2),
+  };
+  function rid() { return `r-${Date.now().toString(36)}`; }
+
+  // =================================================================
+  // INIT / EVENT BINDING
+  // =================================================================
+  function bind() {
+    // top bar
+    $('btnReconnect').onclick = async () => {
+      await checkServer();
+      if (!state.sessionId) await newSession();
+    };
+    $('btnNewSession').onclick = newSession;
+    $('btnToggleSidebar').onclick = () => $('body').classList.toggle('no-sidebar');
+
+    $('baseUrl').addEventListener('change', async () => {
+      await checkServer();
+    });
+
+    // sidebar
+    $('btnRefreshHist').onclick = loadHistory;
+
+    // composer
+    const ta = $('composer');
+    ta.addEventListener('input', () => autoResize(ta));
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        send();
+      }
+    });
+    $('btnSend').onclick = send;
+
+    // debug overlay
+    $('debugBar').onclick = () => $('debugOverlay').classList.toggle('open');
+    $$('.debug-tab').forEach((b) => {
+      b.onclick = (e) => {
+        e.stopPropagation();
+        $$('.debug-tab').forEach((x) => x.classList.remove('active'));
+        b.classList.add('active');
+        $$('.debug-content').forEach((c) => c.classList.remove('active'));
+        document.querySelector(`.debug-content[data-tab=${b.dataset.tab}]`).classList.add('active');
+      };
+    });
+    $('btnClearDebug').onclick = (e) => {
+      e.stopPropagation();
+      $('debugRaw').innerHTML = '';
+      state.recvCount = 0; state.sendCount = 0;
+      $('debugRecvCount').textContent = 0;
+      $('debugSendCount').textContent = 0;
+    };
+
+    $('presetSelect').onchange = () => {
+      const v = $('presetSelect').value;
+      const fn = presets[v];
+      $('rawBody').value = typeof fn === 'function' ? fn() : (fn || '');
+    };
+    $('btnRawSend').onclick = async () => {
+      const text = $('rawBody').value.trim();
+      if (!text) return;
+      let body;
+      try { body = JSON.parse(text); }
+      catch (e) { debug('err', `JSON 解析失败: ${e.message}`); return; }
+      await postIn(body);
+    };
+  }
+
+  async function init() {
+    const saved = localStorage.getItem('ai-bridge-base-url');
+    if (saved) $('baseUrl').value = saved;
+    bind();
+    const ok = await checkServer();
+    if (ok) {
+      await newSession();
+      await loadHistory();
+    }
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+{
+  "name": "ai-bridge-server",
+  "version": "1.0.0",
+  "description": "Remote HTTP+SSE wrapper around ai-bridge daemon for jetbrains-cc-gui plugin",
+  "type": "module",
+  "main": "src/server.js",
+  "bin": {
+    "ai-bridge-server": "src/server.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "start:verbose": "node src/server.js --verbose",
+    "dev": "LOG_LEVEL=debug node src/server.js",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "sql.js": "^1.12.0"
+  }
+}

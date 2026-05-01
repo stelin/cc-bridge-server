@@ -1,0 +1,28 @@
+services:
+  ai-bridge-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ai-bridge-server:latest
+    # Match host uid/gid so files written into mounted dirs have the right owner.
+    user: "${UID:-1000}:${GID:-1000}"
+    ports:
+      - "3284:3284"
+    volumes:
+      # REQUIRED: project directory must be mounted at the SAME absolute path
+      # as on the host. Set PROJECT_PATH in your shell or .env file:
+      #   export PROJECT_PATH=/Users/stelin/Develop/myproject
+      - ${PROJECT_PATH}:${PROJECT_PATH}
+      # OPTIONAL: mount your settings.json / claude.json / codemoss config
+      # if you'd rather not bake them into the image. Note these go to the
+      # CONTAINER home (/home/devuser), NOT the host home.
+      # - ./config/settings.json:/home/devuser/.claude/settings.json:ro
+      # - ./config/claude.json:/home/devuser/.claude.json:ro
+      # - ./config/codemoss:/home/devuser/.codemoss:ro
+    environment:
+      PORT: 3284
+      HOST: 0.0.0.0
+      HOME: /home/devuser
+      LOG_LEVEL: info
+      SESSION_IDLE_TIMEOUT_MS: 60000
+    restart: unless-stopped
