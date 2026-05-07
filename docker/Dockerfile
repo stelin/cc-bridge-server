@@ -7,7 +7,10 @@ USER devuser
 WORKDIR /home/devuser
 
 # 1. Install Claude CLI / SDK (required for daemon to function).
-RUN npm i -g @anthropic-ai/claude-code
+#    - claude-code: the official CLI (used for `claude login` OAuth flow)
+#    - claude-agent-sdk: the JS SDK the daemon imports at runtime (separate
+#      package, not guaranteed to be hoisted from claude-code's deps)
+RUN npm i -g @anthropic-ai/claude-code @anthropic-ai/claude-agent-sdk
 
 # 2. (Optional) Pre-install commonly used MCP servers. Uncomment as needed.
 # RUN npm i -g @modelcontextprotocol/server-github
@@ -28,10 +31,14 @@ WORKDIR /opt/ai-bridge-server
 RUN npm ci --omit=dev || npm install --omit=dev
 COPY --chown=devuser ../src ./src
 COPY --chown=devuser ../ai-bridge ./ai-bridge
+COPY --chown=devuser ../scripts ./scripts
+RUN chmod +x ./scripts/start.sh
 
 EXPOSE 3284
 ENV PORT=3284
 ENV LOG_LEVEL=info
 ENV SESSION_IDLE_TIMEOUT_MS=60000
 
-CMD ["node", "src/server.js"]
+# Use start.sh so NODE_PATH gets set from `npm root -g` at boot — lets the
+# daemon resolve globally installed packages like @anthropic-ai/claude-agent-sdk.
+CMD ["./scripts/start.sh"]

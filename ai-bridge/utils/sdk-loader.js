@@ -103,6 +103,21 @@ function resolveExternalPackageUrl(pkgName, sdkRootDir) {
 }
 
 /**
+ * Check whether a package can be resolved through Node's standard module
+ * resolver (walks up node_modules and honours NODE_PATH). Used as a remote-mode
+ * fallback when the codemoss-managed dependencies dir is empty.
+ */
+function isResolvableByNode(pkgName) {
+    try {
+        // import.meta.resolve is sync in Node 20+ and throws if not resolvable.
+        import.meta.resolve(pkgName);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
  * Check whether the Claude Code SDK is available
  * Logic kept consistent with DependencyManager.isInstalled("claude")
  */
@@ -110,13 +125,20 @@ export function isClaudeSdkAvailable() {
     const sdkId = 'claude-sdk';
     const npmPackage = '@anthropic-ai/claude-agent-sdk';
     const sdkPath = getPackageDirFromRoot(getSdkRootDir(sdkId), npmPackage);
-    const exists = existsSync(sdkPath);
+    if (existsSync(sdkPath)) {
+        console.log('[sdk-loader] isClaudeSdkAvailable: codemoss path', { path: sdkPath, depsBase: DEPS_BASE });
+        return true;
+    }
+    // Remote-mode fallback: SDK may live in the server's own node_modules or
+    // in a globally installed location reachable via NODE_PATH.
+    const remoteResolvable = process.env.AI_BRIDGE_REMOTE_MODE === '1' && isResolvableByNode(npmPackage);
     console.log('[sdk-loader] isClaudeSdkAvailable:', {
-        path: sdkPath,
-        exists: exists,
-        depsBase: DEPS_BASE
+        codemossPath: sdkPath,
+        codemossExists: false,
+        remoteFallback: remoteResolvable,
+        depsBase: DEPS_BASE,
     });
-    return exists;
+    return remoteResolvable;
 }
 
 /**
@@ -155,12 +177,18 @@ export async function loadClaudeSdk() {
         return loadingPromises.get('claude');
     }
 
+    const npmPackage = '@anthropic-ai/claude-agent-sdk';
     const sdkRootDir = getSdkRootDir('claude-sdk');
-    const sdkPath = getPackageDirFromRoot(sdkRootDir, '@anthropic-ai/claude-agent-sdk');
-    console.log('[DIAG-SDK] SDK path:', sdkPath);
-    console.log('[DIAG-SDK] SDK path exists:', existsSync(sdkPath));
+    const sdkPath = getPackageDirFromRoot(sdkRootDir, npmPackage);
+    const codemossExists = existsSync(sdkPath);
+    const isRemoteMode = process.env.AI_BRIDGE_REMOTE_MODE === '1';
+    const remoteResolvable = !codemossExists && isRemoteMode && isResolvableByNode(npmPackage);
 
-    if (!existsSync(sdkPath)) {
+    console.log('[DIAG-SDK] SDK path:', sdkPath);
+    console.log('[DIAG-SDK] codemoss path exists:', codemossExists);
+    console.log('[DIAG-SDK] remote fallback resolvable:', remoteResolvable);
+
+    if (!codemossExists && !remoteResolvable) {
         console.log('[DIAG-SDK] SDK not installed at path');
         throw new Error('SDK_NOT_INSTALLED:claude');
     }
@@ -170,19 +198,27 @@ export async function loadClaudeSdk() {
         try {
             console.log('[DIAG-SDK] SDK root dir:', sdkRootDir);
 
-            // Node ESM does not support import(directory); must resolve to a concrete file (e.g. sdk.mjs)
-            const resolvedUrl = resolveExternalPackageUrl('@anthropic-ai/claude-agent-sdk', sdkRootDir);
-            console.log('[DIAG-SDK] Resolved URL:', resolvedUrl);
-
-            console.log('[DIAG-SDK] Starting dynamic import...');
-            const sdk = await import(resolvedUrl);
+            let sdk;
+            if (codemossExists) {
+                // Node ESM does not support import(directory); must resolve to a concrete file (e.g. sdk.mjs)
+                const resolvedUrl = resolveExternalPackageUrl(npmPackage, sdkRootDir);
+                console.log('[DIAG-SDK] Resolved URL:', resolvedUrl);
+                console.log('[DIAG-SDK] Starting dynamic import (codemoss path)...');
+                sdk = await import(resolvedUrl);
+            } else {
+                // Remote-mode fallback: import by package name and let Node's
+                // resolver walk node_modules / NODE_PATH (works for server-bundled
+                // deps and globally installed packages).
+                console.log('[DIAG-SDK] Starting dynamic import (remote-mode standard resolution)...');
+                sdk = await import(npmPackage);
+            }
             console.log('[DIAG-SDK] SDK imported successfully, exports:', Object.keys(sdk));
 
             sdkCache.set('claude', sdk);
             return sdk;
         } catch (error) {
             console.log('[DIAG-SDK] SDK import failed:', error.message);
-            const pkgDir = getPackageDirFromRoot(sdkRootDir, '@anthropic-ai/claude-agent-sdk');
+            const pkgDir = getPackageDirFromRoot(sdkRootDir, npmPackage);
             const hintFile = join(pkgDir, 'sdk.mjs');
             const hint = existsSync(hintFile) ? ` Did you mean to import ${hintFile}?` : '';
             throw new Error(`Failed to load Claude SDK: ${error.message}${hint}`);
