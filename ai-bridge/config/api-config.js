@@ -191,6 +191,14 @@ function loadCodemossConfig() {
 }
 
 export function getClaudeRuntimeState() {
+  // Remote-mode daemons are spawned by ai-bridge-server inside a container that
+  // never has ~/.codemoss/config.json — credentials live directly in
+  // ~/.claude/settings.json (or process.env). Treat as local-settings provider
+  // so the activation gate doesn't block reads.
+  if (process.env.AI_BRIDGE_REMOTE_MODE === '1') {
+    return { access: 'local', currentId: LOCAL_SETTINGS_PROVIDER_ID };
+  }
+
   const config = loadCodemossConfig();
   const claude = config?.claude && typeof config.claude === 'object' ? config.claude : null;
   const providers = claude?.providers && typeof claude.providers === 'object' ? claude.providers : {};
@@ -340,6 +348,18 @@ export function setupApiKey() {
   const runtimeState = getClaudeRuntimeState();
   const settings = loadClaudeSettings();
   injectNetworkEnvVars(settings);
+
+  // Capture remote-mode env credentials before clearRuntimeAuthEnv() wipes them
+  // so deployers can use `docker run -e ANTHROPIC_API_KEY=...` without mounting
+  // a settings.json. Only honoured when AI_BRIDGE_REMOTE_MODE=1 (set by the
+  // ai-bridge-server when spawning the daemon).
+  const isRemoteMode = process.env.AI_BRIDGE_REMOTE_MODE === '1';
+  const remoteEnvAuthToken = isRemoteMode ? process.env.ANTHROPIC_AUTH_TOKEN : undefined;
+  const remoteEnvApiKey = isRemoteMode ? process.env.ANTHROPIC_API_KEY : undefined;
+  const remoteEnvBaseUrl = isRemoteMode
+    ? (process.env.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_API_URL)
+    : undefined;
+
   clearRuntimeAuthEnv();
 
   debugLog('[DIAG-CONFIG] Runtime provider access:', runtimeState.access, runtimeState.currentId || '(none)');
@@ -361,6 +381,9 @@ export function setupApiKey() {
   if (settings?.env?.ANTHROPIC_BASE_URL) {
     baseUrl = settings.env.ANTHROPIC_BASE_URL;
     baseUrlSource = 'settings.json';
+  } else if (remoteEnvBaseUrl) {
+    baseUrl = remoteEnvBaseUrl;
+    baseUrlSource = 'process.env (remote mode)';
   }
 
   // HIGHEST PRIORITY: CLI login mode. When user explicitly opted in via plugin UI,
@@ -395,6 +418,14 @@ export function setupApiKey() {
     apiKey = settings?.env?.CLAUDE_CODE_USE_BEDROCK;
     authType = 'aws_bedrock';  // AWS Bedrock authentication
     apiKeySource = 'settings.json (AWS_BEDROCK)';
+  } else if (remoteEnvAuthToken) {
+    apiKey = remoteEnvAuthToken;
+    authType = 'auth_token';
+    apiKeySource = 'process.env ANTHROPIC_AUTH_TOKEN (remote mode)';
+  } else if (remoteEnvApiKey) {
+    apiKey = remoteEnvApiKey;
+    authType = 'api_key';
+    apiKeySource = 'process.env ANTHROPIC_API_KEY (remote mode)';
   }
 
   if (!apiKey) {
@@ -418,6 +449,27 @@ export function setupApiKey() {
 
       debugLog('[DEBUG] Auth type:', authType);
       return { apiKey: null, baseUrl, authType, apiKeySource, baseUrlSource };
+    }
+
+    // Remote mode: the server admin may have authorised the daemon container
+    // via the official `claude login` flow, which stores OAuth credentials
+    // outside settings.json (e.g. ~/.claude/.credentials.json). In that case
+    // there is nothing for setupApiKey to inject — fall through to the SDK's
+    // native auth flow rather than throwing.
+    if (isRemoteMode) {
+      debugLog('[INFO] Remote mode: no explicit credentials, delegating to SDK native auth flow');
+      process.env.ANTHROPIC_API_KEY = '';
+      process.env.ANTHROPIC_AUTH_TOKEN = '';
+      if (baseUrl) {
+        process.env.ANTHROPIC_BASE_URL = baseUrl;
+      }
+      return {
+        apiKey: null,
+        baseUrl,
+        authType: 'cli_login',
+        apiKeySource: 'remote mode (SDK native auth)',
+        baseUrlSource,
+      };
     }
 
     console.error('[ERROR] API Key not configured.');

@@ -19,6 +19,8 @@ export function createHistoryRouter({ root }) {
           return await readSession(req, res, root, url.searchParams);
         case '/history/session-lite':
           return await readSessionLite(res, root, url.searchParams);
+        case '/history/project-data':
+          return await readProjectData(res, root, url.searchParams);
         // /history/search 二期实现
         default:
           res.writeHead(404).end();
@@ -227,4 +229,193 @@ function clamp(n, lo, hi) {
 function sendJSON(res, status, obj) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(obj));
+}
+
+// ===== /history/project-data =====
+
+async function readProjectData(res, root, params) {
+  const raw = params.get('projectPath') || '';
+  if (!raw) throw httpError(400, 'projectPath required');
+
+  const dirName = resolveProjectDirName(raw);
+  const projectDir = resolveSafe(root, dirName);
+
+  let files;
+  try {
+    files = (await fs.promises.readdir(projectDir)).filter((f) => f.endsWith('.jsonl'));
+  } catch (e) {
+    if (e.code === 'ENOENT') {
+      return sendJSON(res, 200, {
+        success: true,
+        sessions: [],
+        currentProject: dirName,
+        total: 0,
+        sessionCount: 0,
+      });
+    }
+    throw e;
+  }
+
+  const sessions = [];
+  for (const f of files) {
+    const full = path.join(projectDir, f);
+    const info = await scanSession(full);
+    if (info) sessions.push(info);
+  }
+
+  sessions.sort((a, b) => (b.lastTimestamp || 0) - (a.lastTimestamp || 0));
+
+  sendJSON(res, 200, {
+    success: true,
+    sessions,
+    currentProject: dirName,
+    total: sessions.length,
+    sessionCount: sessions.length,
+  });
+}
+
+/**
+ * Auto-detect input format: raw absolute path → claude-encoded dir name,
+ * otherwise treat as already-encoded dir name (or base64url).
+ */
+function resolveProjectDirName(input) {
+  // Absolute path → claude convention encode
+  if (input.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(input)) {
+    return claudeEncode(input);
+  }
+  // Try base64url decode; if result looks like an absolute path, use encoded form
+  try {
+    const decoded = base64UrlDecode(input);
+    if (decoded.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(decoded)) {
+      return claudeEncode(decoded);
+    }
+  } catch {}
+  // Already a dir name like "-Users-foo-bar"
+  return input;
+}
+
+/** /Users/foo/bar → -Users-foo-bar */
+function claudeEncode(absPath) {
+  return absPath.replace(/[\/\\:]/g, '-');
+}
+
+async function scanSession(filePath) {
+  let content;
+  try {
+    content = await fs.promises.readFile(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+  const fileName = path.basename(filePath);
+  const sessionId = fileName.replace(/\.jsonl$/, '');
+
+  const lines = content.split('\n');
+  const messages = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const obj = safeJson(line);
+    if (obj) messages.push(obj);
+  }
+  if (messages.length === 0) return null;
+
+  let lastTs = 0;
+  for (const m of messages) {
+    if (m.timestamp) {
+      const t = parseTimestamp(m.timestamp);
+      if (t > lastTs) lastTs = t;
+    }
+  }
+
+  const title = generateSummary(messages);
+  if (!isValidSession(sessionId, title, messages.length)) return null;
+
+  let fileSize = 0;
+  try {
+    const st = await fs.promises.stat(filePath);
+    fileSize = st.size;
+  } catch {}
+
+  return {
+    sessionId,
+    title,
+    messageCount: messages.length,
+    lastTimestamp: lastTs,
+    firstTimestamp: lastTs,
+    fileSize,
+  };
+}
+
+function generateSummary(messages) {
+  for (const msg of messages) {
+    if (msg.type === 'user' && !msg.isMeta && msg.message?.content != null) {
+      let text = extractTextFromContent(msg.message.content);
+      if (text) {
+        text = extractCommandMessageContent(text);
+        text = sanitizeAndTruncateSingleLine(text, 45);
+        if (text) return text;
+      }
+    }
+  }
+  return null;
+}
+
+function isValidSession(sessionId, summary, messageCount) {
+  if (!sessionId || sessionId.startsWith('agent-')) return false;
+  if (!summary) return false;
+  const lower = summary.toLowerCase();
+  if (lower === 'warmup' || lower === 'no prompt'
+      || lower.startsWith('warmup') || lower.startsWith('no prompt')) {
+    return false;
+  }
+  return messageCount >= 2;
+}
+
+function extractTextFromContent(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const parts = [];
+    for (const item of content) {
+      if (item && item.type === 'text' && typeof item.text === 'string') {
+        parts.push(item.text);
+      }
+    }
+    const r = parts.join(' ').trim();
+    return r || null;
+  }
+  return null;
+}
+
+/**
+ * Mirrors TagExtractor.extractCommandMessageContent: if text contains
+ * <command-message>...</command-message>, return that (optionally with args).
+ */
+function extractCommandMessageContent(text) {
+  if (!text) return text;
+  const cmdMsg = extractTag(text, 'command-message');
+  if (cmdMsg == null) return text;
+  const cmdArgs = extractTag(text, 'command-args');
+  if (cmdArgs && cmdArgs.trim()) return `${cmdMsg} ${cmdArgs}`.trim();
+  return cmdMsg.trim();
+}
+
+function extractTag(text, tagName) {
+  const re = new RegExp(`<${tagName}>([\\s\\S]*?)</${tagName}>`);
+  const m = text.match(re);
+  return m ? m[1] : null;
+}
+
+/**
+ * Mirrors TextSanitizer.sanitizeAndTruncateSingleLine: collapse whitespace,
+ * trim, truncate to maxLen with ellipsis.
+ */
+function sanitizeAndTruncateSingleLine(text, maxLen) {
+  if (!text) return '';
+  let s = text.replace(/\s+/g, ' ').trim();
+  if (s.length > maxLen) s = s.slice(0, maxLen) + '...';
+  return s;
+}
+
+function parseTimestamp(s) {
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? 0 : t;
 }

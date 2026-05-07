@@ -22,7 +22,7 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
     let child;
     try {
       child = spawn(process.execPath, [DAEMON_PATH], {
-        env: { ...process.env },
+        env: { ...process.env, AI_BRIDGE_REMOTE_MODE: '1' },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (e) {
