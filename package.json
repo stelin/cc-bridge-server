@@ -17,6 +17,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.58",
     "sql.js": "^1.12.0"
   }
 }
