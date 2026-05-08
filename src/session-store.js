@@ -19,8 +19,14 @@ export function createSessionStore({ filePath, debounceMs = 200 } = {}) {
   const file = filePath || path.join(os.homedir(), '.cc-bridge', 'sessions.json');
   let getSnapshot = () => ({ version: FORMAT_VERSION, sessions: [] });
   let saveTimer = null;
-  let saving = false;
-  let pendingWhileSaving = false;
+  // Promise of the currently-running write, or null when idle. Concurrent
+  // flush() calls coalesce onto this so `await flush()` resolves only after
+  // the data is actually durable.
+  let inflight = null;
+  // Set when a flush() call arrives while another write is already in flight.
+  // The owner of the write loop will trigger another doWrite() after the
+  // current one settles. Late awaiters spin on `inflight` until it clears.
+  let queued = false;
 
   function setSnapshotProvider(fn) {
     getSnapshot = fn;
@@ -55,12 +61,7 @@ export function createSessionStore({ filePath, debounceMs = 200 } = {}) {
     saveTimer.unref?.();
   }
 
-  async function flush() {
-    if (saving) {
-      pendingWhileSaving = true;
-      return;
-    }
-    saving = true;
+  async function doWrite() {
     try {
       const snapshot = getSnapshot();
       await fs.promises.mkdir(path.dirname(file), { recursive: true });
@@ -69,13 +70,27 @@ export function createSessionStore({ filePath, debounceMs = 200 } = {}) {
       await fs.promises.rename(tmp, file);
     } catch (e) {
       logger.warn(`session store: write failed (${e.message})`);
-    } finally {
-      saving = false;
-      if (pendingWhileSaving) {
-        pendingWhileSaving = false;
-        scheduleFlush();
-      }
     }
+  }
+
+  async function flush() {
+    // Late arrivals: a write is already in flight. Mark that another pass
+    // is needed so the owner picks it up, then wait for the queue to drain.
+    if (inflight) {
+      queued = true;
+      do {
+        await inflight;
+      } while (inflight);
+      return;
+    }
+    // We are the owner. Drain doWrite() until no more flushes have queued
+    // up while we were writing — this guarantees the snapshot at the moment
+    // of the *last* flush() entry has been written before we resolve.
+    do {
+      queued = false;
+      inflight = doWrite();
+      try { await inflight; } finally { inflight = null; }
+    } while (queued);
   }
 
   return { load, scheduleFlush, flush, setSnapshotProvider, filePath: file };
