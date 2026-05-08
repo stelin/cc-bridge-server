@@ -304,13 +304,19 @@ async function processRequest(request) {
     // NOTE: Heartbeat/status requests bypass the command queue and may run
     // concurrently. This is safe because they never read process.env values
     // set here — they only return timestamps and memory usage.
+    //
+    // Equality skip: in remote mode the daemon is spawned with
+    // IDEA_PROJECT_PATH/PROJECT_PATH already set by session-manager.js. Each
+    // claude.send sends the same values in params.env; without the skip below
+    // the finally block would `delete process.env[key]`, wiping the values
+    // that were set at spawn time and leaving subsequent code paths blind.
     if (params.env && typeof params.env === 'object') {
       for (const [key, value] of Object.entries(params.env)) {
-        if (value !== undefined && value !== null) {
-          // Save original value (undefined means key didn't exist)
-          savedEnv[key] = process.env[key];
-          process.env[key] = String(value);
-        }
+        if (value === undefined || value === null) continue;
+        const v = String(value);
+        if (process.env[key] === v) continue;       // already at target value, skip save/restore
+        savedEnv[key] = process.env[key];
+        process.env[key] = v;
       }
     }
 

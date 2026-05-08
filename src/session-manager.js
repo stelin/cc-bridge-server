@@ -5,6 +5,7 @@
  */
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 import crypto from 'node:crypto';
@@ -17,21 +18,74 @@ const DAEMON_PATH = path.resolve(__dirname, '../ai-bridge/daemon.js');
 export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
   const sessions = new Map(); // sid -> Session
 
-  function create(req, res) {
+  async function create(req, res) {
+    // 1. Read body — POST /session now requires { projectPath: "..." }.
+    let body = '';
+    try {
+      for await (const chunk of req) {
+        body += chunk;
+        if (body.length > 64 * 1024) {
+          return sendJSON(res, 413, { code: 'BODY_TOO_LARGE', error: 'body too large' });
+        }
+      }
+    } catch (e) {
+      return sendJSON(res, 400, { code: 'BAD_BODY', error: `read body failed: ${e.message}` });
+    }
+
+    let projectPath = null;
+    if (body.trim()) {
+      try {
+        const json = JSON.parse(body);
+        if (json && typeof json.projectPath === 'string' && json.projectPath) {
+          projectPath = json.projectPath;
+        }
+      } catch (e) {
+        return sendJSON(res, 400, { code: 'BAD_JSON', error: `invalid JSON body: ${e.message}` });
+      }
+    }
+
+    // 2. projectPath is mandatory — see design §1 rule 9.
+    if (!projectPath) {
+      return sendJSON(res, 400, {
+        code: 'PROJECT_PATH_REQUIRED',
+        error: 'projectPath is a required field of POST /session',
+      });
+    }
+
+    // 3. The path must be reachable from the server process.
+    try {
+      const st = fs.statSync(projectPath);
+      if (!st.isDirectory()) throw new Error('not a directory');
+    } catch (e) {
+      logger.warn(`POST /session rejected: projectPath not accessible: ${projectPath} (${e.message})`);
+      return sendJSON(res, 400, {
+        code: 'PROJECT_PATH_NOT_ACCESSIBLE',
+        error: `projectPath not accessible on server: ${projectPath}`,
+        projectPath,
+      });
+    }
+
+    // 4. Spawn the daemon with cwd + env bound to the project path.
     const sid = crypto.randomUUID();
     let child;
     try {
       child = spawn(process.execPath, [DAEMON_PATH], {
-        env: { ...process.env, AI_BRIDGE_REMOTE_MODE: '1' },
+        cwd: projectPath,
+        env: {
+          ...process.env,
+          AI_BRIDGE_REMOTE_MODE: '1',
+          IDEA_PROJECT_PATH: projectPath,
+          PROJECT_PATH:      projectPath,
+        },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (e) {
       logger.error('Failed to spawn daemon', e);
-      return sendJSON(res, 500, { error: `spawn failed: ${e.message}` });
+      return sendJSON(res, 500, { code: 'SPAWN_FAILED', error: `spawn failed: ${e.message}` });
     }
 
     const hub = createSseHub({ bufferSize: 1000, tag: sid.slice(0, 8) });
-    const session = { sid, child, hub, idleTimer: null, createdAt: Date.now() };
+    const session = { sid, child, hub, idleTimer: null, createdAt: Date.now(), projectPath };
     sessions.set(sid, session);
 
     // daemon stdout -> hub (one event per line)
@@ -67,8 +121,8 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
     });
 
     armIdleTimer(session);
-    logger.info(`session created sid=${sid} pid=${child.pid}`);
-    sendJSON(res, 200, { sessionId: sid, pid: child.pid });
+    logger.info(`session created sid=${sid} pid=${child.pid} projectPath=${projectPath}`);
+    sendJSON(res, 200, { sessionId: sid, pid: child.pid, projectPath });
   }
 
   function subscribeSse(sid, req, res) {
@@ -177,6 +231,7 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
         sessionId: sid,
         pid: s.child.pid,
         createdAt: s.createdAt,
+        projectPath: s.projectPath || null,
         subscribers: s.hub.subscriberCount(),
         alive: s.child.exitCode === null && !s.child.killed,
       });
