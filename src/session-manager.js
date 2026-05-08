@@ -1,7 +1,23 @@
 /**
- * Session manager: each session maps to one daemon child process plus an
- * SSE event hub. Idle sessions (no SSE subscribers for `idleTimeoutMs`) are
- * automatically reaped to prevent orphan daemons.
+ * Session manager.
+ *
+ * A bridge "session" is a stable contract identified by `bridgeSid`. It owns:
+ *   - projectPath (locked at creation time)
+ *   - an SSE Hub that survives daemon restarts (so Last-Event-ID replay works)
+ *   - the captured Claude session id, used to resume the underlying conversation
+ *     when the daemon child is recreated
+ *   - a daemon child process whose lifetime is decoupled from the bridge sid
+ *
+ * Lifecycle states:
+ *   - 'active'      daemon is running, bridge sid bound to a live child
+ *   - 'freezing'    idle reaper sent SIGTERM; waiting for child to exit
+ *   - 'frozen'      child exited cleanly via idle reap; sid + hub kept alive
+ *                   for transparent reconnect. Will be GC'd after maxFrozenMs.
+ *   - 'destroying'  user requested DELETE; waiting for child to exit
+ *
+ * Reconnect flow: a frozen session is thawed on the next subscribeSse / writeIn
+ * by spawning a fresh daemon. If we already captured a Claude session id, we
+ * inject it into writeIn payloads so the new daemon resumes the conversation.
  */
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
@@ -15,11 +31,13 @@ import { logger } from './logger.js';
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const DAEMON_PATH = path.resolve(__dirname, '../ai-bridge/daemon.js');
 
-export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
+export function createSessionManager({
+  idleTimeoutMs = 60_000,
+  maxFrozenMs = 24 * 60 * 60 * 1000,
+} = {}) {
   const sessions = new Map(); // sid -> Session
 
   async function create(req, res) {
-    // 1. Read body — POST /session now requires { projectPath: "..." }.
     let body = '';
     try {
       for await (const chunk of req) {
@@ -44,7 +62,6 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
       }
     }
 
-    // 2. projectPath is mandatory — see design §1 rule 9.
     if (!projectPath) {
       return sendJSON(res, 400, {
         code: 'PROJECT_PATH_REQUIRED',
@@ -52,7 +69,6 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
       });
     }
 
-    // 3. The path must be reachable from the server process.
     try {
       const st = fs.statSync(projectPath);
       if (!st.isDirectory()) throw new Error('not a directory');
@@ -65,64 +81,127 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
       });
     }
 
-    // 4. Spawn the daemon with cwd + env bound to the project path.
     const sid = crypto.randomUUID();
-    let child;
+    const hub = createSseHub({ bufferSize: 1000, tag: sid.slice(0, 8) });
+    const session = {
+      sid,
+      projectPath,
+      hub,
+      child: null,
+      claudeSid: null,
+      state: 'active',
+      idleTimer: null,
+      maxFrozenTimer: null,
+      createdAt: Date.now(),
+      lastActiveAt: Date.now(),
+    };
+    sessions.set(sid, session);
+
     try {
-      child = spawn(process.execPath, [DAEMON_PATH], {
-        cwd: projectPath,
-        env: {
-          ...process.env,
-          AI_BRIDGE_REMOTE_MODE: '1',
-          IDEA_PROJECT_PATH: projectPath,
-          PROJECT_PATH:      projectPath,
-        },
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
+      spawnDaemon(session);
     } catch (e) {
+      sessions.delete(sid);
+      hub.close();
       logger.error('Failed to spawn daemon', e);
       return sendJSON(res, 500, { code: 'SPAWN_FAILED', error: `spawn failed: ${e.message}` });
     }
 
-    const hub = createSseHub({ bufferSize: 1000, tag: sid.slice(0, 8) });
-    const session = { sid, child, hub, idleTimer: null, createdAt: Date.now(), projectPath };
-    sessions.set(sid, session);
+    armIdleTimer(session);
+    logger.info(`session created sid=${sid} pid=${session.child.pid} projectPath=${projectPath}`);
+    sendJSON(res, 200, { sessionId: sid, pid: session.child.pid, projectPath });
+  }
 
-    // daemon stdout -> hub (one event per line)
+  function spawnDaemon(s) {
+    const child = spawn(process.execPath, [DAEMON_PATH], {
+      cwd: s.projectPath,
+      env: {
+        ...process.env,
+        AI_BRIDGE_REMOTE_MODE: '1',
+        IDEA_PROJECT_PATH: s.projectPath,
+        PROJECT_PATH:      s.projectPath,
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    s.child = child;
+    s.state = 'active';
+    s.lastActiveAt = Date.now();
+    cancelMaxFrozenTimer(s);
+
     const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
     rl.on('line', (line) => {
       const trimmed = line.trim();
-      if (trimmed) hub.publish(trimmed);
+      if (!trimmed) return;
+      maybeCaptureClaudeSid(s, trimmed);
+      s.hub.publish(trimmed);
     });
 
-    // stderr -> server log only (never leaked to clients)
     child.stderr.on('data', (d) => {
       const text = d.toString().trimEnd();
-      if (text) logger.warn(`[daemon ${sid.slice(0, 8)}] ${text}`);
+      if (text) logger.warn(`[daemon ${s.sid.slice(0, 8)}] ${text}`);
     });
 
     child.on('exit', (code, signal) => {
-      logger.info(`daemon exited code=${code} signal=${signal} sid=${sid}`);
-      // Last gasp event so any subscribers reconnect/close gracefully.
+      const prevState = s.state;
+      logger.info(`daemon exited code=${code} signal=${signal} sid=${s.sid} state=${prevState}`);
+
+      if (prevState === 'freezing') {
+        s.state = 'frozen';
+        s.child = null;
+        cancelIdleTimer(s);
+        armMaxFrozenTimer(s);
+        return;
+      }
+
+      if (prevState === 'destroying') {
+        s.hub.close();
+        sessions.delete(s.sid);
+        cancelIdleTimer(s);
+        cancelMaxFrozenTimer(s);
+        return;
+      }
+
+      // 'active' state crash — surface as DAEMON_DOWN and tear down the session
       try {
-        hub.publish(JSON.stringify({
+        s.hub.publish(JSON.stringify({
           type: '_ctrl',
           action: 'gateway_error',
           message: `daemon exited code=${code} signal=${signal || 'none'}`,
           code: 'DAEMON_DOWN',
         }));
       } catch {}
-      hub.close();
-      sessions.delete(sid);
+      s.hub.close();
+      sessions.delete(s.sid);
+      cancelIdleTimer(s);
+      cancelMaxFrozenTimer(s);
     });
 
     child.on('error', (err) => {
-      logger.error(`daemon error sid=${sid}`, err);
+      logger.error(`daemon error sid=${s.sid}`, err);
     });
 
-    armIdleTimer(session);
-    logger.info(`session created sid=${sid} pid=${child.pid} projectPath=${projectPath}`);
-    sendJSON(res, 200, { sessionId: sid, pid: child.pid, projectPath });
+    return child;
+  }
+
+  // Captures the Claude-side conversation id from daemon stdout. Daemon emits
+  // either "[SESSION_ID] <uuid>" plain-text lines or JSON lines whose
+  // session_id field carries the value.
+  function maybeCaptureClaudeSid(s, line) {
+    let candidate = null;
+    if (line.startsWith('[SESSION_ID]')) {
+      const m = line.match(/\[SESSION_ID\]\s+([a-fA-F0-9-]+)/);
+      if (m) candidate = m[1];
+    } else if (line.startsWith('{')) {
+      try {
+        const obj = JSON.parse(line);
+        const v = obj && (obj.session_id || obj.sessionId);
+        if (typeof v === 'string' && /^[a-fA-F0-9-]{8,}$/.test(v)) candidate = v;
+      } catch {}
+    }
+    if (candidate && candidate !== s.claudeSid) {
+      const prev = s.claudeSid ? s.claudeSid.slice(0, 8) : '(none)';
+      s.claudeSid = candidate;
+      logger.info(`claudeSid captured sid=${s.sid.slice(0, 8)} prev=${prev} now=${candidate.slice(0, 8)}`);
+    }
   }
 
   function subscribeSse(sid, req, res) {
@@ -131,7 +210,20 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
       logger.warn(`SSE subscribe rejected: session not found sid=${sid}`);
       return sendJSON(res, 404, { error: 'session not found' });
     }
+
+    if (s.state === 'frozen') {
+      try {
+        const tag = s.claudeSid ? s.claudeSid.slice(0, 8) : '(none)';
+        logger.info(`thawing for SSE subscribe sid=${sid.slice(0, 8)} claudeSid=${tag}`);
+        spawnDaemon(s);
+      } catch (e) {
+        logger.error(`thaw spawn failed sid=${sid.slice(0, 8)}`, e);
+        return sendJSON(res, 500, { code: 'THAW_FAILED', error: `thaw failed: ${e.message}` });
+      }
+    }
+
     cancelIdleTimer(s);
+    s.lastActiveAt = Date.now();
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -139,7 +231,6 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
-    // Initial comment so the client opens the stream eagerly.
     try { res.write(': connected\n\n'); } catch {}
 
     const lastIdHeader = req.headers['last-event-id'];
@@ -150,8 +241,6 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
     req.on('close', () => {
       s.hub.detach(res);
       logger.info(`SSE detached sid=${sid.slice(0, 8)} subs=${s.hub.subscriberCount()}`);
-      // If session still exists (daemon alive) and no other subscribers, arm
-      // idle timer.
       if (sessions.has(sid)) armIdleTimer(s);
     });
   }
@@ -161,10 +250,6 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
     if (!s) {
       logger.warn(`writeIn rejected: session not found sid=${sid}`);
       return sendJSON(res, 404, { error: 'session not found' });
-    }
-    if (s.child.exitCode !== null || s.child.killed) {
-      logger.warn(`writeIn rejected: daemon dead sid=${sid.slice(0, 8)}`);
-      return sendJSON(res, 410, { error: 'daemon dead' });
     }
 
     let body = '';
@@ -181,15 +266,45 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
     body = body.trim();
     if (!body) return sendJSON(res, 400, { error: 'empty body' });
 
-    // Validate single-line JSON. Reject multi-line bodies so we never write
-    // multiple commands on one stdin write.
     if (body.includes('\n')) {
       return sendJSON(res, 400, { error: 'body must be a single JSON line' });
     }
+    let parsed;
     try {
-      JSON.parse(body);
+      parsed = JSON.parse(body);
     } catch (e) {
       return sendJSON(res, 400, { error: `invalid JSON: ${e.message}` });
+    }
+
+    // Transparently inject the captured Claude sid so a freshly-thawed daemon
+    // resumes the same conversation. Honor any client-provided sessionId.
+    let injected = false;
+    if (s.claudeSid && parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const inStdin =
+        parsed.stdinData && typeof parsed.stdinData === 'object' && !Array.isArray(parsed.stdinData);
+      const hasTopSid = typeof parsed.sessionId === 'string' && parsed.sessionId !== '';
+      const hasNestedSid = inStdin && typeof parsed.stdinData.sessionId === 'string' && parsed.stdinData.sessionId !== '';
+      if (!hasTopSid && !hasNestedSid) {
+        if (inStdin) parsed.stdinData.sessionId = s.claudeSid;
+        else parsed.sessionId = s.claudeSid;
+        body = JSON.stringify(parsed);
+        injected = true;
+      }
+    }
+
+    if (s.state === 'frozen') {
+      try {
+        logger.info(`thawing for writeIn sid=${sid.slice(0, 8)}`);
+        spawnDaemon(s);
+      } catch (e) {
+        logger.error(`thaw spawn failed sid=${sid.slice(0, 8)}`, e);
+        return sendJSON(res, 500, { code: 'THAW_FAILED', error: `thaw failed: ${e.message}` });
+      }
+    }
+
+    if (!s.child || s.child.exitCode !== null || s.child.killed) {
+      logger.warn(`writeIn rejected: daemon dead sid=${sid.slice(0, 8)}`);
+      return sendJSON(res, 410, { error: 'daemon dead' });
     }
 
     try {
@@ -198,13 +313,16 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
       logger.warn(`stdin write failed sid=${sid.slice(0, 8)}: ${e.message}`);
       return sendJSON(res, 500, { error: `stdin write failed: ${e.message}` });
     }
+
+    s.lastActiveAt = Date.now();
+
     let preview = body;
     try {
-      const parsed = JSON.parse(body);
-      const m = parsed.method || parsed.action || parsed.type || '?';
+      const m = parsed.method || parsed.action || parsed.type || parsed.command || '?';
       preview = `method=${m}${parsed.id ? ' id=' + String(parsed.id).slice(0, 8) : ''}`;
     } catch {}
-    logger.info(`writeIn sid=${sid.slice(0, 8)} bytes=${body.length} ${preview}`);
+    const inj = injected ? ` injected-claudeSid=${s.claudeSid.slice(0, 8)}` : '';
+    logger.info(`writeIn sid=${sid.slice(0, 8)} bytes=${body.length} ${preview}${inj}`);
     if (logger.isVerbose()) {
       const full = body.length > 1200 ? body.slice(0, 1200) + `...(${body.length}b)` : body;
       logger.verbose(`writeIn sid=${sid.slice(0, 8)} body=${full}`);
@@ -215,9 +333,16 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
   function destroy(sid, res) {
     const s = sessions.get(sid);
     if (s) {
-      logger.info(`session destroy requested sid=${sid.slice(0, 8)}`);
-      gracefulKill(s.child);
-      // Hub close happens on child 'exit'.
+      logger.info(`session destroy requested sid=${sid.slice(0, 8)} state=${s.state}`);
+      cancelIdleTimer(s);
+      cancelMaxFrozenTimer(s);
+      if (s.state === 'frozen' || !s.child) {
+        s.hub.close();
+        sessions.delete(sid);
+      } else {
+        s.state = 'destroying';
+        gracefulKill(s.child);
+      }
     } else {
       logger.warn(`session destroy: not found sid=${sid}`);
     }
@@ -229,21 +354,29 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
     for (const [sid, s] of sessions) {
       out.push({
         sessionId: sid,
-        pid: s.child.pid,
+        pid: s.child ? s.child.pid : null,
+        claudeSessionId: s.claudeSid,
+        state: s.state,
         createdAt: s.createdAt,
+        lastActiveAt: s.lastActiveAt,
         projectPath: s.projectPath || null,
         subscribers: s.hub.subscriberCount(),
-        alive: s.child.exitCode === null && !s.child.killed,
+        alive: !!(s.child && s.child.exitCode === null && !s.child.killed),
       });
     }
     sendJSON(res, 200, out);
   }
 
   function armIdleTimer(s) {
+    if (s.state !== 'active') return;
+    if (idleTimeoutMs <= 0) return;
     if (s.hub.subscriberCount() > 0) return;
     cancelIdleTimer(s);
     s.idleTimer = setTimeout(() => {
-      logger.info(`session ${s.sid} idle ${idleTimeoutMs}ms with no SSE subscriber, killing`);
+      if (s.state !== 'active') return;
+      if (s.hub.subscriberCount() > 0) return;
+      logger.info(`session ${s.sid} idle ${idleTimeoutMs}ms with no SSE subscriber, freezing`);
+      s.state = 'freezing';
       gracefulKill(s.child);
     }, idleTimeoutMs);
     s.idleTimer.unref?.();
@@ -256,7 +389,27 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
     }
   }
 
+  function armMaxFrozenTimer(s) {
+    cancelMaxFrozenTimer(s);
+    if (maxFrozenMs <= 0) return;
+    s.maxFrozenTimer = setTimeout(() => {
+      if (s.state !== 'frozen') return;
+      logger.info(`session ${s.sid} frozen for ${maxFrozenMs}ms with no reconnect, destroying`);
+      s.hub.close();
+      sessions.delete(s.sid);
+    }, maxFrozenMs);
+    s.maxFrozenTimer.unref?.();
+  }
+
+  function cancelMaxFrozenTimer(s) {
+    if (s.maxFrozenTimer) {
+      clearTimeout(s.maxFrozenTimer);
+      s.maxFrozenTimer = null;
+    }
+  }
+
   function gracefulKill(child) {
+    if (!child) return;
     try { child.kill('SIGTERM'); } catch {}
     const t = setTimeout(() => {
       try { child.kill('SIGKILL'); } catch {}
@@ -266,7 +419,11 @@ export function createSessionManager({ idleTimeoutMs = 60_000 } = {}) {
 
   function shutdownAll(cb) {
     logger.info(`shutting down ${sessions.size} session(s)`);
-    for (const s of sessions.values()) gracefulKill(s.child);
+    for (const s of sessions.values()) {
+      cancelIdleTimer(s);
+      cancelMaxFrozenTimer(s);
+      if (s.child) gracefulKill(s.child);
+    }
     setTimeout(cb, 1000);
   }
 

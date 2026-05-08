@@ -25,12 +25,16 @@ import { logger } from './logger.js';
 const PORT = parseInt(process.env.PORT || '3284', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '60000', 10);
+const MAX_FROZEN_MS = parseInt(process.env.SESSION_MAX_FROZEN_MS || String(24 * 60 * 60 * 1000), 10);
 const HISTORY_ROOT = process.env.HISTORY_ROOT || path.join(os.homedir(), '.claude/projects');
 
 const PKG_VERSION = readPackageVersion();
 const DAEMON_VERSION = '1.0.0'; // keep in sync with ai-bridge/daemon.js
 
-const sessions = createSessionManager({ idleTimeoutMs: IDLE_TIMEOUT_MS });
+const sessions = createSessionManager({
+  idleTimeoutMs: IDLE_TIMEOUT_MS,
+  maxFrozenMs: MAX_FROZEN_MS,
+});
 const history = createHistoryRouter({ root: HISTORY_ROOT });
 
 const server = http.createServer(async (req, res) => {
@@ -109,7 +113,8 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   logger.info(`ai-bridge-server v${PKG_VERSION} listening on http://${HOST}:${PORT}`);
   logger.info(`History root: ${HISTORY_ROOT}`);
-  logger.info(`Idle timeout: ${IDLE_TIMEOUT_MS}ms`);
+  logger.info(`Idle timeout (active->frozen): ${IDLE_TIMEOUT_MS}ms`);
+  logger.info(`Max frozen lifetime (frozen->destroyed): ${MAX_FROZEN_MS}ms`);
   logger.info(`Verbose logging: ${logger.isVerbose() ? 'ON' : 'off'} (toggle with --verbose / -v / VERBOSE=1)`);
 });
 
