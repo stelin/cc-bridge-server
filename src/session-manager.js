@@ -447,6 +447,10 @@ export function createSessionManager({
     for (const s of sessions.values()) {
       cancelIdleTimer(s);
       cancelMaxFrozenTimer(s);
+      // Treat shutdown as a fleet-wide freeze: the daemon goes away but the
+      // bridge contract (sid + claudeSid + projectPath) is persisted so the
+      // next process startup can hydrate and resume on reconnect.
+      if (s.state === 'active') s.state = 'freezing';
       if (s.child) gracefulKill(s.child);
     }
     setTimeout(cb, 1000);
