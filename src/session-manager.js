@@ -208,22 +208,18 @@ export function createSessionManager({
     return child;
   }
 
-  // Captures the Claude-side conversation id from daemon stdout. Daemon emits
-  // either "[SESSION_ID] <uuid>" plain-text lines or JSON lines whose
-  // session_id field carries the value.
+  // Captures the Claude-side conversation id from daemon stdout. Daemon wraps
+  // every internal line as {"id":"<reqId>","line":"..."}, so the SESSION_ID
+  // tag and the system-init JSON's session_id both arrive embedded in the
+  // wrapper. Match the canonical UUID anywhere on the line, anchored to either
+  // the "[SESSION_ID]" tag or a "session_id" key (raw or JSON-escaped).
   function maybeCaptureClaudeSid(s, line) {
-    let candidate = null;
-    if (line.startsWith('[SESSION_ID]')) {
-      const m = line.match(/\[SESSION_ID\]\s+([a-fA-F0-9-]+)/);
-      if (m) candidate = m[1];
-    } else if (line.startsWith('{')) {
-      try {
-        const obj = JSON.parse(line);
-        const v = obj && (obj.session_id || obj.sessionId);
-        if (typeof v === 'string' && /^[a-fA-F0-9-]{8,}$/.test(v)) candidate = v;
-      } catch {}
-    }
-    if (candidate && candidate !== s.claudeSid) {
+    const m = line.match(
+      /(?:\[SESSION_ID\]|session_id)["\\:\s]+([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})/
+    );
+    if (!m) return;
+    const candidate = m[1];
+    if (candidate !== s.claudeSid) {
       const prev = s.claudeSid ? s.claudeSid.slice(0, 8) : '(none)';
       s.claudeSid = candidate;
       logger.info(`claudeSid captured sid=${s.sid.slice(0, 8)} prev=${prev} now=${candidate.slice(0, 8)}`);
