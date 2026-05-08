@@ -964,3 +964,153 @@ done
 | **本仓库新写代码合计** | | **~1370** |
 
 业务零改动（channels/services/utils/config/permission-handler 等共 ~3000 行），透明继承 daemon 的全部能力。
+
+---
+
+## 附录 A：会话生命周期增强（2026-05-08）
+
+### A.1 背景
+
+初版实现里 `bridgeSid` 与 daemon 子进程**强绑定**：客户端 SSE 一旦断连超过 `SESSION_IDLE_TIMEOUT_MS`（默认 60s），idle 回收器就会 SIGTERM daemon 并 `sessions.delete(sid)`。客户端用旧 sid 重连时只能拿到 404，原本的对话上下文（`~/.claude/projects/<cwd>/<claudeSid>.jsonl`）虽然还在磁盘上，但 bridge 这一层已经无法把它接回来。表现就是「用一段时间后开始报 404」。
+
+本次增强把 bridgeSid 从「一个活着的子进程」改成**「一条会话契约」**：sid 稳定、daemon 进程可以起起落落、Claude 会话由服务端用 `claudeSid` 自动续接，并支持跨服务进程重启的元数据持久化。
+
+### A.2 会话状态机
+
+```
+        create               idle (no subscribers, no writes)
+   --------------------> [active] -------------------> [freezing]
+          DELETE                                          | child exit
+          /session/{sid}                                  v
+              |                                       [frozen]
+              v                                          | maxFrozenMs 兜底
+         [destroying] <--- thaw (subscribe / writeIn) ---|
+              | child exit                               | DELETE
+              v                                          v
+         [removed]                                  [removed]
+```
+
+| 状态 | 含义 | child | hub |
+|---|---|---|---|
+| `active` | daemon 正常运行 | 活 | 活 |
+| `freezing` | idle 回收器已 SIGTERM，等 child exit | 死中 | 活 |
+| `frozen` | child 已退出，等待客户端重连透明拉起 | `null` | 活（保留 ring buffer + 订阅协议）|
+| `destroying` | 用户 DELETE 触发，等 child exit | 死中 | 活但即将关闭 |
+
+`subscribeSse` / `writeIn` 收到 `frozen` 状态时调用 `spawnDaemon(s)` 透明解冻，并把后续 daemon 输出继续灌进同一个 hub——客户端的 EventSource 重连感知不到中间换了 daemon。
+
+### A.3 Claude session id 自动注入
+
+daemon stdout 里有两种格式会带出 Claude 端的 `session_id`：
+
+- 文本行：`[SESSION_ID] <uuid>`
+- JSON 行：`{ ..., "session_id": "<uuid>" }` 或 `{ ..., "type":"system", "subtype":"init", "session_id":"<uuid>" }`
+
+服务端的 `maybeCaptureClaudeSid` 抓到后把它存到 `session.claudeSid`。后续 `writeIn` 时如果客户端 payload 里**没有**填 `sessionId`（顶层）或 `stdinData.sessionId`（嵌套），服务端就把 `claudeSid` 注入进去——daemon 那边的 `claude-channel.js` 早已支持把它当 `resumeSessionId`，于是新拉起的 daemon 自动 resume jsonl 续上对话。
+
+> **客户端策略冲突时尊重客户端**：如果 payload 自己带了 `sessionId`，服务端不覆盖。这给了客户端「我就要起新对话」的能力。
+
+### A.4 元数据持久化
+
+`src/session-store.js` 把以下契约字段持久化到 `~/.cc-bridge/sessions.json`（可被 `SESSION_STORE_PATH` 覆盖）：
+
+```json
+{
+  "version": 1,
+  "sessions": [
+    {
+      "sid": "...",
+      "projectPath": "...",
+      "claudeSid": "...",
+      "state": "frozen",
+      "createdAt": 1715170000000,
+      "lastActiveAt": 1715170000000
+    }
+  ]
+}
+```
+
+**显式不持久化**：`child` PID、hub ring buffer、订阅者集合、定时器。重启后所有还活着的 session 都从 `frozen` 起步，daemon 在客户端重连时按需 spawn。
+
+写入策略：
+
+- 200ms 防抖
+- `tmp + rename` 原子换入
+- 触发点：`create` / 抓到新 `claudeSid` / `child.exit` 三分支 / `destroy` / `maxFrozenMs` 兜底删除 / 优雅关停 `flush()`
+
+启动时 `server.js` 顶层 `await store.load()`，再调用 `manager.hydrate(records)` 重建 sessions Map：
+
+- `projectPath` 已不可达 → 跳过 + 警告
+- `now - lastActiveAt >= maxFrozenMs` → 跳过
+- 其它 → 重建为 `frozen`，新建空 hub 标记 `staleForReplay`，按剩余窗口 arm `maxFrozenTimer`
+
+### A.5 客户端契约变更
+
+#### 对插件透明的部分
+
+- `bridgeSid` 持续可用，无需修改重连逻辑。
+- SSE 自动重连（EventSource 默认行为）配合服务端的 freeze/thaw 即可恢复对话。
+- `claudeSid` 由服务端管理，客户端无需感知。
+
+#### 唯一新增的可见事件：`BUFFER_LOST`
+
+```json
+{
+  "type": "_ctrl",
+  "action": "gateway_error",
+  "code": "BUFFER_LOST",
+  "message": "gateway restarted, please refresh history"
+}
+```
+
+- **何时出现**：仅在桥接服务进程被重启过、客户端用旧 `bridgeSid` 重连时。普通的 idle freeze/thaw **不会**触发。
+- **含义**：事件流的中间段（重启窗口期内的事件）不可恢复，但会话契约本身仍然可用。
+- **建议处理**：
+  1. 调 `GET /sessions` 拿到当前 `bridgeSid` 对应的 `claudeSessionId`。
+  2. 调 `GET /history/session?project=<encoded>&sessionId=<claudeSessionId>` 把对话历史补回 UI。
+  3. 之后照常使用同一个 `bridgeSid` 发消息。
+- **与 `DAEMON_DOWN` 的区别**：`DAEMON_DOWN` 表示 session 已销毁（daemon 异常崩溃），客户端**必须**重建 session；`BUFFER_LOST` 表示 sid 仍可用，**只是**事件流出现断档。
+
+### A.6 新环境变量
+
+| 变量 | 默认值 | 含义 |
+|---|---|---|
+| `SESSION_IDLE_TIMEOUT_MS` | `60000` | 无订阅者多久后 freeze；`<=0` 禁用 freeze |
+| `SESSION_MAX_FROZEN_MS` | `86400000`（24h） | frozen 多久后硬销毁；`<=0` 禁用兜底 |
+| `SESSION_STORE_PATH` | `~/.cc-bridge/sessions.json` | 元数据持久化文件路径 |
+
+### A.7 `/sessions` 响应字段扩展
+
+调试接口现在多返回三个字段：
+
+```json
+{
+  "sessionId": "...",
+  "pid": 12345,
+  "claudeSessionId": "...",
+  "state": "active",
+  "createdAt": 1715170000000,
+  "lastActiveAt": 1715170000000,
+  "projectPath": "...",
+  "subscribers": 1,
+  "alive": true
+}
+```
+
+`pid` 在 `frozen` 状态下为 `null`、`alive` 为 `false`。
+
+### A.8 已知不覆盖的边界
+
+- **多进程并发**：同一台机器同时运行多个桥接服务进程会抢同一份 `sessions.json`，未加文件锁。文档保证「同机器单实例」。
+- **SSE ring buffer 不持久化**：跨进程重启后中间事件不可恢复，依赖客户端走 `BUFFER_LOST` 路径补救。
+- **daemon 健康检查**：`active` 状态下 daemon 异常崩溃仍走原 `DAEMON_DOWN` 路径销毁 session，本轮不做自动重启。
+
+### A.9 改动量
+
+| 文件 | 类型 | 行数 |
+|---|---|---|
+| `src/session-manager.js` | 重写 | ~480（替代原 ~280）|
+| `src/session-store.js` | 新增 | ~85 |
+| `src/sse-hub.js` | 加 ~25 行 | +25 |
+| `src/server.js` | 加 ~14 行 | +14 |
+| **本次增强合计** | | **~430（净增）** |
