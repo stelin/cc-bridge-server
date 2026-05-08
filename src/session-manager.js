@@ -171,6 +171,24 @@ export function createSessionManager({
         s.state = 'frozen';
         s.child = null;
         cancelIdleTimer(s);
+
+        // A subscribe/writeIn that arrived during the freezing window asked
+        // us to thaw as soon as the dying child is gone. Honor that request
+        // here so the session goes straight back to 'active' without bouncing
+        // through 'frozen' (which would also briefly arm the max-frozen
+        // timer and drop the session if maxFrozenMs is short).
+        if (s.thawAfterExit) {
+          s.thawAfterExit = false;
+          logger.info(`auto-thaw after freezing exit sid=${s.sid.slice(0, 8)}`);
+          try {
+            spawnDaemon(s);
+            return;
+          } catch (e) {
+            logger.error(`auto-thaw spawn failed sid=${s.sid.slice(0, 8)}`, e);
+            // fall through to frozen state
+          }
+        }
+
         armMaxFrozenTimer(s);
         persist();
         return;
@@ -243,6 +261,13 @@ export function createSessionManager({
         logger.error(`thaw spawn failed sid=${sid.slice(0, 8)}`, e);
         return sendJSON(res, 500, { code: 'THAW_FAILED', error: `thaw failed: ${e.message}` });
       }
+    } else if (s.state === 'freezing') {
+      // The idle reaper already SIGTERM'd the daemon but the child hasn't
+      // exited yet. Don't try to spawn a new daemon now — the existing
+      // child.on('exit') handler is the only safe place to do that. Set a
+      // flag so it auto-thaws after exit. The hub stays attached either way.
+      logger.info(`SSE subscribe during freezing window sid=${sid.slice(0, 8)} — will auto-thaw on exit`);
+      s.thawAfterExit = true;
     }
 
     cancelIdleTimer(s);
@@ -315,6 +340,28 @@ export function createSessionManager({
       }
     }
 
+    // If the idle reaper just SIGTERM'd the daemon, the session is in
+    // 'freezing' but the child may not have exited yet. Mark for auto-thaw,
+    // wait for the dying child to finish — child.on('exit') will then call
+    // spawnDaemon and flip state to 'active' before we proceed.
+    if (s.state === 'freezing') {
+      logger.info(`writeIn during freezing window sid=${sid.slice(0, 8)} — waiting for exit then auto-thaw`);
+      s.thawAfterExit = true;
+      const dyingChild = s.child;
+      if (dyingChild) {
+        await new Promise((resolve) => {
+          const safety = setTimeout(resolve, 6000);
+          safety.unref?.();
+          dyingChild.once('exit', () => {
+            clearTimeout(safety);
+            // Yield once so the child.on('exit') registered earlier (and the
+            // spawnDaemon it triggers) has a chance to run before we read s.state.
+            setImmediate(resolve);
+          });
+        });
+      }
+    }
+
     if (s.state === 'frozen') {
       try {
         logger.info(`thawing for writeIn sid=${sid.slice(0, 8)}`);
@@ -338,6 +385,11 @@ export function createSessionManager({
     }
 
     s.lastActiveAt = Date.now();
+    // A successful write counts as activity. Reset the idle timer so a
+    // session that's being driven purely via POST /in (e.g. SSE momentarily
+    // detached) doesn't get reaped underneath the caller.
+    cancelIdleTimer(s);
+    armIdleTimer(s);
 
     let preview = body;
     try {
