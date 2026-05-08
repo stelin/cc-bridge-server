@@ -34,8 +34,30 @@ const DAEMON_PATH = path.resolve(__dirname, '../ai-bridge/daemon.js');
 export function createSessionManager({
   idleTimeoutMs = 60_000,
   maxFrozenMs = 24 * 60 * 60 * 1000,
+  store = null,
 } = {}) {
   const sessions = new Map(); // sid -> Session
+
+  if (store) {
+    // Persisted snapshot only contains the bridge contract — never the live
+    // child PID, hub buffer, or subscriber list. Sessions that are mid-shutdown
+    // ('destroying') are excluded; everything else is recorded as 'frozen'
+    // because after a process restart the child will always be gone.
+    store.setSnapshotProvider(() => ({
+      version: 1,
+      sessions: [...sessions.values()]
+        .filter((s) => s.state !== 'destroying')
+        .map((s) => ({
+          sid: s.sid,
+          projectPath: s.projectPath,
+          claudeSid: s.claudeSid,
+          state: 'frozen',
+          createdAt: s.createdAt,
+          lastActiveAt: s.lastActiveAt,
+        })),
+    }));
+  }
+  const persist = () => store?.scheduleFlush();
 
   async function create(req, res) {
     let body = '';
@@ -107,6 +129,7 @@ export function createSessionManager({
     }
 
     armIdleTimer(session);
+    persist();
     logger.info(`session created sid=${sid} pid=${session.child.pid} projectPath=${projectPath}`);
     sendJSON(res, 200, { sessionId: sid, pid: session.child.pid, projectPath });
   }
@@ -149,6 +172,7 @@ export function createSessionManager({
         s.child = null;
         cancelIdleTimer(s);
         armMaxFrozenTimer(s);
+        persist();
         return;
       }
 
@@ -157,6 +181,7 @@ export function createSessionManager({
         sessions.delete(s.sid);
         cancelIdleTimer(s);
         cancelMaxFrozenTimer(s);
+        persist();
         return;
       }
 
@@ -173,6 +198,7 @@ export function createSessionManager({
       sessions.delete(s.sid);
       cancelIdleTimer(s);
       cancelMaxFrozenTimer(s);
+      persist();
     });
 
     child.on('error', (err) => {
@@ -201,6 +227,7 @@ export function createSessionManager({
       const prev = s.claudeSid ? s.claudeSid.slice(0, 8) : '(none)';
       s.claudeSid = candidate;
       logger.info(`claudeSid captured sid=${s.sid.slice(0, 8)} prev=${prev} now=${candidate.slice(0, 8)}`);
+      persist();
     }
   }
 
@@ -339,6 +366,7 @@ export function createSessionManager({
       if (s.state === 'frozen' || !s.child) {
         s.hub.close();
         sessions.delete(sid);
+        persist();
       } else {
         s.state = 'destroying';
         gracefulKill(s.child);
@@ -397,6 +425,7 @@ export function createSessionManager({
       logger.info(`session ${s.sid} frozen for ${maxFrozenMs}ms with no reconnect, destroying`);
       s.hub.close();
       sessions.delete(s.sid);
+      persist();
     }, maxFrozenMs);
     s.maxFrozenTimer.unref?.();
   }
@@ -427,7 +456,68 @@ export function createSessionManager({
     setTimeout(cb, 1000);
   }
 
-  return { create, subscribeSse, writeIn, destroy, listSessions, shutdownAll };
+  // Rebuild in-memory sessions from persisted records (server startup).
+  // Each restored session is born 'frozen' with a fresh empty hub flagged
+  // staleForReplay; the daemon respawns lazily on subscribe/write.
+  function hydrate(records) {
+    if (!Array.isArray(records) || records.length === 0) return { restored: 0, dropped: 0 };
+    let restored = 0, dropped = 0;
+    const now = Date.now();
+    for (const r of records) {
+      if (!r || typeof r.sid !== 'string' || typeof r.projectPath !== 'string') {
+        dropped++;
+        continue;
+      }
+      try {
+        const st = fs.statSync(r.projectPath);
+        if (!st.isDirectory()) throw new Error('not a directory');
+      } catch (e) {
+        logger.warn(`hydrate: drop sid=${r.sid.slice(0, 8)} (projectPath ${r.projectPath}: ${e.message})`);
+        dropped++;
+        continue;
+      }
+      // Honor any maxFrozenMs that has already elapsed.
+      const lastActiveAt = typeof r.lastActiveAt === 'number' ? r.lastActiveAt : now;
+      if (maxFrozenMs > 0 && now - lastActiveAt >= maxFrozenMs) {
+        logger.info(`hydrate: drop sid=${r.sid.slice(0, 8)} (exceeded maxFrozenMs)`);
+        dropped++;
+        continue;
+      }
+      const hub = createSseHub({ bufferSize: 1000, tag: r.sid.slice(0, 8) });
+      hub.markStaleForReplay();
+      const session = {
+        sid: r.sid,
+        projectPath: r.projectPath,
+        hub,
+        child: null,
+        claudeSid: typeof r.claudeSid === 'string' ? r.claudeSid : null,
+        state: 'frozen',
+        idleTimer: null,
+        maxFrozenTimer: null,
+        createdAt: typeof r.createdAt === 'number' ? r.createdAt : now,
+        lastActiveAt,
+      };
+      sessions.set(session.sid, session);
+      // Re-arm the hard-expiry timer for the remaining window.
+      if (maxFrozenMs > 0) {
+        const remaining = Math.max(1000, maxFrozenMs - (now - lastActiveAt));
+        session.maxFrozenTimer = setTimeout(() => {
+          if (session.state !== 'frozen') return;
+          logger.info(`session ${session.sid} frozen for ${maxFrozenMs}ms with no reconnect, destroying`);
+          session.hub.close();
+          sessions.delete(session.sid);
+          persist();
+        }, remaining);
+        session.maxFrozenTimer.unref?.();
+      }
+      restored++;
+    }
+    logger.info(`hydrate: restored=${restored} dropped=${dropped}`);
+    if (dropped > 0) persist();
+    return { restored, dropped };
+  }
+
+  return { create, subscribeSse, writeIn, destroy, listSessions, shutdownAll, hydrate };
 }
 
 function sendJSON(res, status, obj) {

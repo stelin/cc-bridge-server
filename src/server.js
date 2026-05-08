@@ -19,6 +19,7 @@ import url from 'node:url';
 import crypto from 'node:crypto';
 
 import { createSessionManager } from './session-manager.js';
+import { createSessionStore } from './session-store.js';
 import { createHistoryRouter } from './history-server.js';
 import { logger } from './logger.js';
 
@@ -26,15 +27,22 @@ const PORT = parseInt(process.env.PORT || '3284', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '60000', 10);
 const MAX_FROZEN_MS = parseInt(process.env.SESSION_MAX_FROZEN_MS || String(24 * 60 * 60 * 1000), 10);
+const SESSION_STORE_PATH = process.env.SESSION_STORE_PATH || null;
 const HISTORY_ROOT = process.env.HISTORY_ROOT || path.join(os.homedir(), '.claude/projects');
 
 const PKG_VERSION = readPackageVersion();
 const DAEMON_VERSION = '1.0.0'; // keep in sync with ai-bridge/daemon.js
 
+const store = createSessionStore({ filePath: SESSION_STORE_PATH });
+const records = await store.load();
+
 const sessions = createSessionManager({
   idleTimeoutMs: IDLE_TIMEOUT_MS,
   maxFrozenMs: MAX_FROZEN_MS,
+  store,
 });
+sessions.hydrate(records);
+
 const history = createHistoryRouter({ root: HISTORY_ROOT });
 
 const server = http.createServer(async (req, res) => {
@@ -115,6 +123,7 @@ server.listen(PORT, HOST, () => {
   logger.info(`History root: ${HISTORY_ROOT}`);
   logger.info(`Idle timeout (active->frozen): ${IDLE_TIMEOUT_MS}ms`);
   logger.info(`Max frozen lifetime (frozen->destroyed): ${MAX_FROZEN_MS}ms`);
+  logger.info(`Session store: ${store.filePath}`);
   logger.info(`Verbose logging: ${logger.isVerbose() ? 'ON' : 'off'} (toggle with --verbose / -v / VERBOSE=1)`);
 });
 
@@ -122,7 +131,10 @@ server.listen(PORT, HOST, () => {
 function shutdown(signal) {
   logger.info(`Received ${signal}, shutting down...`);
   server.close(() => logger.info('HTTP server closed'));
-  sessions.shutdownAll(() => process.exit(0));
+  sessions.shutdownAll(async () => {
+    try { await store.flush(); } catch {}
+    process.exit(0);
+  });
   setTimeout(() => process.exit(1), 8000).unref();
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
