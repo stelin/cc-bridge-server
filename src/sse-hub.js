@@ -45,17 +45,23 @@ export function createSseHub({ bufferSize = 1000, tag = '?' } = {}) {
 
     if (staleForReplay) {
       staleForReplay = false;
-      const id = nextId++;
-      const errLine = JSON.stringify({
-        type: '_ctrl',
-        action: 'gateway_error',
-        message: 'gateway restarted, please refresh history',
-        code: 'BUFFER_LOST',
-      });
-      buffer.push({ id, data: errLine });
-      if (buffer.length > bufferSize) buffer.shift();
-      writeEvent(res, id, errLine);
-      return;
+      // Only signal BUFFER_LOST when the client actually asked for replay
+      // via Last-Event-ID. A fresh subscriber (lastEventId === 0) hasn't
+      // requested anything to be replayed, so spamming it with a control
+      // event would force needless recovery flows.
+      if (lastEventId > 0) {
+        const id = nextId++;
+        const errLine = JSON.stringify({
+          type: '_ctrl',
+          action: 'gateway_error',
+          message: 'gateway restarted, please refresh history',
+          code: 'BUFFER_LOST',
+        });
+        buffer.push({ id, data: errLine });
+        if (buffer.length > bufferSize) buffer.shift();
+        writeEvent(res, id, errLine);
+        return;
+      }
     }
 
     // Tell the subscriber its starting event id (so the heartbeat carries
