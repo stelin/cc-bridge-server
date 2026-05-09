@@ -15,11 +15,20 @@ const LEVEL = (process.env.LOG_LEVEL || (VERBOSE ? 'debug' : 'info')).toLowerCas
 const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
 const THRESHOLD = LEVELS[LEVEL] ?? LEVELS.info;
 
+function pad(n, w = 2) {
+  return String(n).padStart(w, '0');
+}
+
+function localTimestamp() {
+  const d = new Date();
+  return `${pad(d.getFullYear() % 100)}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+}
+
 function log(level, ...args) {
   if (LEVELS[level] < THRESHOLD) return;
-  const ts = new Date().toISOString();
   // eslint-disable-next-line no-console
-  console.error(`[${ts}][${level.toUpperCase()}]`, ...args);
+  console.error(`[${localTimestamp()}][${level.toUpperCase()}]`, ...args);
 }
 
 export const logger = {
