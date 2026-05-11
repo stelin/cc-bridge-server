@@ -155,6 +155,17 @@ export function createSessionManager({
       const trimmed = line.trim();
       if (!trimmed) return;
       maybeCaptureClaudeSid(s, trimmed);
+      // Surface [REASONING_EFFORT] markers into server log.
+      // daemon wraps its stdout into {"id":"...","line":"..."} — scan both raw + wrapped.
+      if (trimmed.includes('[REASONING_EFFORT]')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          const inner = typeof parsed?.line === 'string' ? parsed.line : trimmed;
+          logger.info(`[daemon ${s.sid.slice(0, 8)}] ${inner}`);
+        } catch {
+          logger.info(`[daemon ${s.sid.slice(0, 8)}] ${trimmed}`);
+        }
+      }
       s.hub.publish(trimmed);
     });
 

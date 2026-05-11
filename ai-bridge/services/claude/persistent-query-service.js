@@ -50,6 +50,16 @@ import {
   shouldOutputMessage,
 } from './stream-event-processor.js';
 
+const SUPPORTED_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+function normalizeReasoningEffort(value) {
+  const e = typeof value === 'string' ? value.trim() : '';
+  if (!e) return null;
+  if (SUPPORTED_EFFORT_LEVELS.has(e)) return e;
+  console.warn(`[REASONING_EFFORT] ⚠️ unsupported effort value received: ${JSON.stringify(value)} — falling back to SDK default`);
+  return null;
+}
+
 function resolveThinkingTokens(params, settings) {
   const alwaysThinkingEnabled = settings?.alwaysThinkingEnabled ?? true;
   const configuredMax = settings?.maxThinkingTokens
@@ -76,7 +86,7 @@ function buildSystemPromptAppend(params) {
   return buildIDEContextPrompt(openedFiles, agentPrompt);
 }
 
-function buildQueryOptions(workingDirectory, sdkModelName, permissionMode, maxThinkingTokens, streamingEnabled, systemPromptAppend, requestedSessionId) {
+function buildQueryOptions(workingDirectory, sdkModelName, permissionMode, maxThinkingTokens, streamingEnabled, systemPromptAppend, requestedSessionId, reasoningEffort) {
   return {
     cwd: workingDirectory,
     permissionMode,
@@ -85,6 +95,7 @@ function buildQueryOptions(workingDirectory, sdkModelName, permissionMode, maxTh
     enableFileCheckpointing: true,
     env: buildCliEnv(),
     ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
+    ...(reasoningEffort && { effort: reasoningEffort }),
     ...(streamingEnabled && { includePartialMessages: true }),
     additionalDirectories: Array.from(
       new Set(
@@ -153,12 +164,23 @@ async function buildRequestContext(params, withAttachments) {
 
   const permissionMode = normalizePermissionMode(params.permissionMode);
   const streamingEnabled = resolveStreamingEnabled(params, settings);
-  const maxThinkingTokens = resolveThinkingTokens(params, settings);
+  const normalizedReasoningEffort = normalizeReasoningEffort(params.reasoningEffort);
+  // effort 与 maxThinkingTokens 互斥:设置了 effort 时禁用 maxThinkingTokens
+  const maxThinkingTokens = normalizedReasoningEffort
+    ? undefined
+    : resolveThinkingTokens(params, settings);
   const systemPromptAppend = buildSystemPromptAppend(params);
+
+  if (normalizedReasoningEffort) {
+    console.log(`[REASONING_EFFORT] ✓ persistent buildRequestContext applied options.effort=${normalizedReasoningEffort} (model=${sdkModelName ?? modelId ?? 'default'}, maxThinkingTokens disabled due to mutex)`);
+  } else {
+    console.log(`[REASONING_EFFORT] ⊝ persistent buildRequestContext: no effort set (model=${sdkModelName ?? modelId ?? 'default'}, maxThinkingTokens=${maxThinkingTokens ?? 'undefined'}, raw=${JSON.stringify(params.reasoningEffort ?? null)})`);
+  }
 
   const options = buildQueryOptions(
     workingDirectory, sdkModelName, permissionMode,
-    maxThinkingTokens, streamingEnabled, systemPromptAppend, requestedSessionId
+    maxThinkingTokens, streamingEnabled, systemPromptAppend, requestedSessionId,
+    normalizedReasoningEffort
   );
 
   const userMessage = await buildUserMessage(params, withAttachments, requestedSessionId);
