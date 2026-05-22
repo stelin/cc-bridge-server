@@ -26,8 +26,13 @@
 import { createInterface } from 'readline';
 import { handleClaudeCommand } from './channels/claude-channel.js';
 import { handleCodexCommand } from './channels/codex-channel.js';
+import {
+  startSupervisorSession,
+  postEventToSupervisor,
+  stopSupervisorSession,
+  stopAllSupervisorSessions,
+} from './channels/supervisor-channel.js';
 import { loadClaudeSdk, isClaudeSdkAvailable } from './utils/sdk-loader.js';
-import { handleControlResponse } from './permission-ipc.js';
 import {
   sendMessagePersistent,
   sendMessageWithAttachmentsPersistent,
@@ -54,7 +59,8 @@ injectNetworkEnvVars();
 // =============================================================================
 
 // NOTE: Keep in sync with package.json version when updating.
-const DAEMON_VERSION = '1.0.0';
+const DAEMON_VERSION = '1.0.0-supervisor';
+const SUPERVISOR_SUPPORT = true;
 
 // =============================================================================
 // State
@@ -77,10 +83,6 @@ const _originalStdoutWrite = process.stdout.write.bind(process.stdout);
 const _originalStderrWrite = process.stderr.write.bind(process.stderr);
 const _originalConsoleLog = console.log.bind(console);
 const _originalConsoleError = console.error.bind(console);
-
-// Expose raw stdout writer to permission-ipc.js so it can emit `_ctrl` envelope
-// messages without being wrapped by the per-request stdout interception below.
-globalThis.__rawStdoutWrite = (s) => _originalStdoutWrite(s, 'utf8');
 
 /**
  * Write a raw NDJSON line to stdout (bypasses interception).
@@ -276,6 +278,7 @@ async function processRequest(request) {
 
   // --- Graceful shutdown ---
   if (method === 'shutdown') {
+    await stopAllSupervisorSessions();
     await shutdownPersistentRuntimes();
     sendDaemonEvent('shutdown', { reason: 'requested' });
     writeRawLine({ id: id || '0', done: true, success: true });
@@ -304,19 +307,13 @@ async function processRequest(request) {
     // NOTE: Heartbeat/status requests bypass the command queue and may run
     // concurrently. This is safe because they never read process.env values
     // set here — they only return timestamps and memory usage.
-    //
-    // Equality skip: in remote mode the daemon is spawned with
-    // IDEA_PROJECT_PATH/PROJECT_PATH already set by session-manager.js. Each
-    // claude.send sends the same values in params.env; without the skip below
-    // the finally block would `delete process.env[key]`, wiping the values
-    // that were set at spawn time and leaving subsequent code paths blind.
     if (params.env && typeof params.env === 'object') {
       for (const [key, value] of Object.entries(params.env)) {
-        if (value === undefined || value === null) continue;
-        const v = String(value);
-        if (process.env[key] === v) continue;       // already at target value, skip save/restore
-        savedEnv[key] = process.env[key];
-        process.env[key] = v;
+        if (value !== undefined && value !== null) {
+          // Save original value (undefined means key didn't exist)
+          savedEnv[key] = process.env[key];
+          process.env[key] = String(value);
+        }
       }
     }
 
@@ -340,6 +337,19 @@ async function processRequest(request) {
       await preconnectPersistent(stdinData);
     } else if (provider === 'claude' && command === 'resetRuntime') {
       await resetRuntimePersistent(stdinData);
+    } else if (provider === 'supervisor') {
+      // Supervisor commands: start / postEvent / stop.
+      // They share the same NDJSON envelope; output (ACTION lines) is written
+      // via the standard process.stdout, which gets tagged with the request id.
+      if (command === 'start') {
+        await startSupervisorSession(stdinData);
+      } else if (command === 'postEvent') {
+        await postEventToSupervisor(stdinData);
+      } else if (command === 'stop') {
+        await stopSupervisorSession(stdinData);
+      } else {
+        throw new Error(`Unknown supervisor command: ${command}`);
+      }
     } else {
       // Dispatch to the existing handlers for non-send commands.
       switch (provider) {
@@ -432,7 +442,11 @@ async function processRequest(request) {
   sendDaemonEvent('ready', {
     pid: process.pid,
     sdkPreloaded,
+    supervisorSupport: SUPERVISOR_SUPPORT,
   });
+  // Print a clearly grep-able marker so users diagnosing "is the new daemon
+  // actually running?" can verify in idea.log.
+  _originalStderrWrite('[daemon] supervisor channel: LOADED (v' + DAEMON_VERSION + ')\n', 'utf8');
 
   // --- Listen for requests on stdin ---
   const rl = createInterface({
@@ -456,13 +470,6 @@ async function processRequest(request) {
         `[daemon] Invalid JSON input: ${line.substring(0, 200)}\n`,
         'utf8'
       );
-      return;
-    }
-
-    // Control messages (permission/ask/plan responses) — route to permission-ipc
-    // and skip normal request processing.
-    if (request.type === '_ctrl') {
-      handleControlResponse(request);
       return;
     }
 

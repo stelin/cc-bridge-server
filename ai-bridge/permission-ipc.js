@@ -13,7 +13,7 @@
  *
  * Wire format (stdin — server forwards from client POST /session/{id}/in):
  *   {"type":"_ctrl","action":"permission_response","requestId":"...","allow":true}
- *   {"type":"_ctrl","action":"ask_user_question_response","requestId":"...","answers":[...]}
+ *   {"type":"_ctrl","action":"ask_user_question_response","requestId":"...","answers":{questionKey: answerValue, ...}}
  *   {"type":"_ctrl","action":"plan_approval_response","requestId":"...","approved":true,"editedPlan":null}
  *
  * Public API signatures match the original file-based implementation, so
