@@ -314,6 +314,19 @@ async function executeTurn(runtime, requestContext, turnMeta) {
   }
 }
 
+// Pattern matches Anthropic API rejection when 1M context beta is requested
+// without the entitlement (paid credits / Tier 4). The exact phrase has been
+// stable; we keep it case-insensitive and forgiving to minor wording shifts.
+const LONG_CONTEXT_NOT_ENTITLED_PATTERN = /usage credits.*required.*long\s*context|long\s*context.*requires?.*credits/i;
+
+function detectClaudeErrorCode(messageText) {
+  if (typeof messageText !== 'string' || !messageText) return null;
+  if (LONG_CONTEXT_NOT_ENTITLED_PATTERN.test(messageText)) {
+    return 'LONG_CONTEXT_NOT_ENTITLED';
+  }
+  return null;
+}
+
 function emitSendError(runtime, error, requestContext) {
   const payload = {
     success: false,
@@ -331,6 +344,14 @@ function emitSendError(runtime, error, requestContext) {
   }
 
   payload.error = truncateString(payload.error, 2500);
+
+  // Classify well-known API errors so the UI can self-correct (e.g. auto-disable
+  // 1M context toggle when the account lacks the entitlement) without showing
+  // the raw upstream wording.
+  const claudeErrorCode = detectClaudeErrorCode(payload.error);
+  if (claudeErrorCode) {
+    payload.code = claudeErrorCode;
+  }
 
   console.error('[SEND_ERROR]', JSON.stringify(payload));
   console.log('[SEND_ERROR]', JSON.stringify(payload));

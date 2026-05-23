@@ -109,7 +109,13 @@ function formatTurnEnd(p, elapsed) {
   if (typeof p.durationMs === 'number') {
     lines.push(`duration_ms: ${p.durationMs}`);
   }
-  lines.push('', '请判断当前步骤是否完成并决策。');
+  lines.push(
+    '',
+    '## 必做（review 协议）',
+    '在 emit_action 之前，**必须**对 modified_in_plan 中的文件至少调用一次 `Read`（关键段即可）。',
+    '若主 AI 自述"加了 X / 已处理 Y"，必须用 `Grep` 验证是否真的存在，不可只看自然语言相信。',
+    '跳过文件工具直接 emit_action 视为协议违例。'
+  );
   return lines.join('\n');
 }
 

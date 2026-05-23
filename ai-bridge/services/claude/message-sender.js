@@ -368,6 +368,8 @@ function logLoopError(error, lp) {
 /**
  * Handle top-level catch for both send functions: emit stream end on error and format error payload.
  */
+const LONG_CONTEXT_NOT_ENTITLED_PATTERN_LEGACY = /usage credits.*required.*long\s*context|long\s*context.*requires?.*credits/i;
+
 function handleSendError(error, streamState, sdkStderrLines) {
   if (streamState.streamingEnabled && streamState.streamStarted && !streamState.streamEnded) {
     // NOTE: Do NOT emit accumulatedUsage at stream end, even on error.
@@ -382,6 +384,9 @@ function handleSendError(error, streamState, sdkStderrLines) {
     payload.details.sdkError = sdkErrorText;
   }
   payload.error = truncateString(payload.error);
+  if (LONG_CONTEXT_NOT_ENTITLED_PATTERN_LEGACY.test(payload.error || '')) {
+    payload.code = 'LONG_CONTEXT_NOT_ENTITLED';
+  }
   console.error('[SEND_ERROR]', JSON.stringify(payload));
 }
 

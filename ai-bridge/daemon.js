@@ -54,6 +54,18 @@ import { injectNetworkEnvVars } from './config/api-config.js';
 // verification errors.
 injectNetworkEnvVars();
 
+// Default the Claude Code CLI's autocompact trigger to a more conservative
+// threshold (70% of context window). The CLI's built-in default (~95% — leaves
+// only a ~13K-token buffer) leaves no headroom for a single turn that reads
+// several files at once, which is exactly the workload the v3 Supervisor has.
+// The supervisor channel may override this per-pair when `supervisor.start`
+// carries an explicit `autoCompactThreshold` value (see supervisor-channel.js).
+// Note: this is a daemon-process-wide env, so it also applies to the main AI
+// channel — which is the intended behaviour per the Q1 alignment with the user.
+if (!process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE) {
+  process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = '70';
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -441,6 +453,7 @@ async function processRequest(request) {
   // Signal ready
   sendDaemonEvent('ready', {
     pid: process.pid,
+    version: DAEMON_VERSION,
     sdkPreloaded,
     supervisorSupport: SUPERVISOR_SUPPORT,
   });

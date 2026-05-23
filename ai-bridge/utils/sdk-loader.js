@@ -275,6 +275,67 @@ export async function loadCodexSdk() {
 }
 
 /**
+ * Load the {@code zod} package that ships alongside the Claude Agent SDK
+ * install (peer dependency). Used by the Supervisor's {@code emit_action}
+ * tool to declare its input schema.
+ *
+ * Resolution order (mirrors loadClaudeSdk):
+ *   1. ~/.codemoss/dependencies/claude-sdk/node_modules/zod — populated by
+ *      DependencyManager when the user installs the Claude SDK via the IDE.
+ *   2. Remote-mode fallback (AI_BRIDGE_REMOTE_MODE=1): standard Node
+ *      resolution via `import('zod')`, finds it in the server's own
+ *      node_modules (pulled in as a transitive dep of
+ *      @anthropic-ai/claude-agent-sdk).
+ *
+ * @returns {Promise<{z: object, default: object}>}
+ */
+export async function loadZod() {
+    if (sdkCache.has('zod')) {
+        return sdkCache.get('zod');
+    }
+    if (loadingPromises.has('zod')) {
+        return loadingPromises.get('zod');
+    }
+
+    const sdkRootDir = getSdkRootDir('claude-sdk');
+    const zodPackageDir = join(sdkRootDir, 'node_modules', 'zod');
+    const codemossExists = existsSync(zodPackageDir);
+    const isRemoteMode = process.env.AI_BRIDGE_REMOTE_MODE === '1';
+    const remoteResolvable = !codemossExists && isRemoteMode && isResolvableByNode('zod');
+
+    if (!codemossExists && !remoteResolvable) {
+        throw new Error('SDK_NOT_INSTALLED:zod (expected at ' + zodPackageDir
+            + ', remote fallback unavailable)');
+    }
+
+    const loadPromise = (async () => {
+        try {
+            let mod;
+            if (codemossExists) {
+                const entry = resolveEntryFileFromPackageDir(zodPackageDir);
+                if (!entry) {
+                    throw new Error('Unable to resolve zod entry file from ' + zodPackageDir);
+                }
+                mod = await import(pathToFileURL(entry).href);
+            } else {
+                // Remote-mode fallback: let Node's resolver find zod in
+                // server-bundled node_modules or NODE_PATH.
+                mod = await import('zod');
+            }
+            sdkCache.set('zod', mod);
+            return mod;
+        } catch (error) {
+            throw new Error(`Failed to load zod: ${error.message}`);
+        } finally {
+            loadingPromises.delete('zod');
+        }
+    })();
+
+    loadingPromises.set('zod', loadPromise);
+    return loadPromise;
+}
+
+/**
  * Load the base Anthropic SDK (used as an API fallback)
  * @returns {Promise<{Anthropic: Class}>}
  */
