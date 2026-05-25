@@ -1,6 +1,8 @@
 import { AsyncStream } from '../../utils/async-stream.js';
 import { loadClaudeSdk } from '../../utils/sdk-loader.js';
 import { createPreToolUseHook, normalizePermissionMode } from './permission-mode.js';
+import { buildSubagentStopHook } from '../supervisor/subagent-stop-hook.js';
+import { buildMainAiMcpServer, MAIN_MCP_NAME } from './main-ai-tools.js';
 import {
   beginRuntimeTurn,
   cleanupStaleAnonymousRuntimes as cleanupAnonymousFromRegistry,
@@ -16,14 +18,18 @@ import {
 
 let cachedQueryFn = null;
 
-export function buildRuntimeSignature(options, systemPromptAppend, streamingEnabled, runtimeSessionEpoch) {
+export function buildRuntimeSignature(options, systemPromptAppend, streamingEnabled, runtimeSessionEpoch, pairId) {
+  // Protocol v2 (2026-05-24): include pairId in the signature so a Pair-mode
+  // runtime is NEVER reused by a non-Pair request (and vice versa). Same pairId
+  // continues to reuse, which is what we want for back-to-back Pair turns.
   const material = {
     cwd: options.cwd || '',
     additionalDirectories: options.additionalDirectories || [],
     systemPromptAppend: systemPromptAppend || '',
     streamingEnabled: !!streamingEnabled,
     runtimeSessionEpoch: runtimeSessionEpoch || '',
-    model: options.model || ''
+    model: options.model || '',
+    pairId: pairId || '',
   };
   return JSON.stringify(material);
 }
@@ -79,6 +85,14 @@ async function createRuntime(requestContext, callbacks) {
   const queryFn = await ensureQueryFn();
   const initialPermissionMode = normalizePermissionMode(requestContext.permissionMode);
 
+  // Protocol v2 (2026-05-24): pairContext-aware runtime. When Java side opens
+  // a Pair, requestContext.pairContext.pairId is set; the runtime then gets
+  // (a) SubagentStop hook forwarding subagent results to the supervisor, and
+  // (b) mcp__main MCP server exposing report_turn_completion. Non-Pair
+  // requests skip both — legacy behaviour fully preserved.
+  const pairContext = requestContext.pairContext || null;
+  const pairId = pairContext?.pairId || null;
+
   const runtime = {
     closed: false,
     sessionId: requestContext.requestedSessionId || null,
@@ -93,7 +107,13 @@ async function createRuntime(requestContext, callbacks) {
     activeTurnCount: 0,
     stderrLines: [],
     query: null,
-    inputStream: new AsyncStream()
+    inputStream: new AsyncStream(),
+    // Protocol v2: pair-mode bookkeeping. Mutated by executeTurn on each
+    // active turn so MCP tools (report_turn_completion) can tag emitted lines
+    // with the correct directive id.
+    pairId,
+    activeDirectiveId: pairContext?.activeDirectiveId || null,
+    currentTurnId: null,
   };
 
   const options = {
@@ -112,7 +132,9 @@ async function createRuntime(requestContext, callbacks) {
     }
   };
 
-  options.hooks = {
+  // Hooks: PreToolUse for permissions (always). SubagentStop is added only in
+  // Pair mode — it forwards [SUBAGENT_STOP] NDJSON tagged with runtime context.
+  const hooks = {
     ...(options.hooks || {}),
     PreToolUse: [{
       hooks: [createPreToolUseHook(runtime.permissionModeState, options.cwd, async (mode) => {
@@ -133,6 +155,27 @@ async function createRuntime(requestContext, callbacks) {
       })]
     }]
   };
+  if (pairId) {
+    hooks.SubagentStop = [{
+      hooks: [buildSubagentStopHook(runtime)],
+    }];
+  }
+  options.hooks = hooks;
+
+  // mcp__main MCP server (Pair mode only). report_turn_completion writes a
+  // [TURN_REPORT] NDJSON line that the Java EventBus consumes.
+  if (pairId) {
+    try {
+      const mainMcp = await buildMainAiMcpServer(runtime);
+      options.mcpServers = {
+        ...(options.mcpServers || {}),
+        [MAIN_MCP_NAME]: mainMcp,
+      };
+    } catch (err) {
+      console.error('[LIFECYCLE] buildMainAiMcpServer failed (Pair mode degraded, '
+        + 'report_turn_completion will be unavailable):', err?.message || err);
+    }
+  }
 
   runtime.query = queryFn({
     prompt: runtime.inputStream,
@@ -143,7 +186,8 @@ async function createRuntime(requestContext, callbacks) {
 
   console.log('[LIFECYCLE] createRuntime sessionId=' + (runtime.sessionId || '(new)')
     + ' epoch=' + (runtime.runtimeSessionEpoch || '(none)')
-    + ' signature=' + runtime.runtimeSignature);
+    + ' signature=' + runtime.runtimeSignature
+    + (pairId ? ' pairId=' + pairId : ''));
 
   return runtime;
 }

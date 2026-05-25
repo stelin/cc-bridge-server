@@ -29,9 +29,13 @@ import { summarizeEvent } from '../services/supervisor/event-summarizer.js';
 import {
     buildSupervisorMcpServer,
     QUALIFIED_EMIT_ACTION,
+    QUALIFIED_UPDATE_STATE,
+    QUALIFIED_SAVE_PLAN,
     SUPERVISOR_MCP_NAME,
     EMIT_ACTION_TOOL_NAME,
 } from '../services/supervisor/supervisor-tools.js';
+import { buildPreCompactHook } from '../services/supervisor/pre-compact-hook.js';
+import { PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from '../services/supervisor/protocol-v2.js';
 
 const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
 
@@ -40,6 +44,86 @@ const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
 // Grep to flag TODO/FIXME/stub functions). Write/Edit/Bash remain forbidden
 // — supervisors decide, the main AI edits.
 const SUPERVISOR_READ_TOOLS = ['Read', 'Glob', 'Grep'];
+
+// Protocol v2 (2026-05-24): the supervisor may delegate review/manifest tasks
+// to its OWN subagents via the SDK Task tool. Subagent's tool whitelist is
+// constrained by the subagent prompt (R1 decision: general-purpose, no
+// pre-defined types — keep simple). Note the Task tool itself does NOT let
+// the supervisor write files; only the supervisor's subagents do, and they
+// run in their own isolated context per SDK semantics.
+const SUPERVISOR_AGENT_TOOLS = ['Task'];
+
+// 2026-05-25 (FUNDAMENTAL FIX): wall-clock caps on the active path were
+// CONFLATING "stuck" with "slow but progressing". A Task subagent that reads
+// a 60K-token design doc takes minutes by design — that's not a fault, that's
+// the work. Any fixed cap will misfire; we just shifted at what duration the
+// misfire happens by tweaking constants. Pointless.
+//
+// New design: the active path has NO wall-clock cap. Liveness is detected
+// via three orthogonal signals, NONE of which are wall-clock:
+//   1. SDK-internal timeouts (API call, network, batch size) — Anthropic's
+//      SDK throws on its own transport failures. We bubble them up.
+//   2. Manual user interrupt — `supervisor.interrupt` RPC calls
+//      `runtime.query.interrupt()`; the active `query.next()` settles
+//      cleanly. Wired to a Stop button in the supervisor pane.
+//   3. Daemon process death — Java's SupervisorBridge IPC layer detects
+//      stdout EOF and rejects pending futures with a connection error.
+//
+// What we KEEP:
+//   - per-frame `prev_frame_kind` tracking (purely for diagnostic logging)
+//   - end-of-turn diagnostic dumps (so post-mortem of "wedged" turns works)
+//
+// What we REMOVE:
+//   - the Promise.race against a setTimeout in nextWithTimeout
+//   - the `SUPERVISOR_QUERY_TIMEOUT` synthetic error
+//   - the after_tool_use / after_compact stage-aware timeout caps
+//
+// If a turn genuinely wedges (no frame arrives for hours, nothing the user
+// expects), the user clicks Stop. We do not pretend to know better than them.
+//
+// Env knobs still honoured for emergency rollback (set any to a positive ms
+// value to re-enable a wall-clock cap on the corresponding stage):
+//   SUPERVISOR_QUERY_TIMEOUT_MS                 — default stage
+//   SUPERVISOR_QUERY_TIMEOUT_AFTER_TOOL_USE_MS  — after tool_use frame
+//   SUPERVISOR_QUERY_TIMEOUT_AFTER_COMPACT_MS   — after compact_boundary frame
+// When unset (default), each stage runs uncapped.
+const QUERY_NEXT_TIMEOUT_MS = readEnvMsOrZero('SUPERVISOR_QUERY_TIMEOUT_MS');
+const QUERY_NEXT_TIMEOUT_AFTER_TOOL_USE_MS = readEnvMsOrZero('SUPERVISOR_QUERY_TIMEOUT_AFTER_TOOL_USE_MS');
+const QUERY_NEXT_TIMEOUT_AFTER_COMPACT_MS = readEnvMsOrZero('SUPERVISOR_QUERY_TIMEOUT_AFTER_COMPACT_MS');
+
+function readEnvMsOrZero(name) {
+    const raw = process.env[name];
+    const n = raw ? Number(raw) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * Wait for the SDK's next iterator result. If `timeoutMs > 0` (env-opt-in
+ * emergency rollback), race against a wall-clock cap and throw
+ * `SUPERVISOR_QUERY_TIMEOUT` on expiry. Default ({@code timeoutMs === 0}) is
+ * an unbounded await — the normal mode of operation post-2026-05-25.
+ */
+async function nextWithOptionalTimeout(query, timeoutMs, stage = 'default') {
+    if (!(timeoutMs > 0)) {
+        return await query.next();
+    }
+    let timer;
+    try {
+        return await Promise.race([
+            query.next(),
+            new Promise((_, reject) => {
+                timer = setTimeout(
+                    () => reject(new Error(
+                        `SUPERVISOR_QUERY_TIMEOUT after ${timeoutMs}ms (stage=${stage})`
+                    )),
+                    timeoutMs
+                );
+            }),
+        ]);
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
 
 /** @type {Map<string, SupervisorRuntime>} */
 const runtimes = new Map();
@@ -72,6 +156,16 @@ class SupervisorRuntime {
          * @type {string | null}
          */
         this.currentTurnId = null;
+
+        // Phase 2 (2026-05-24): diagnostic counters surfaced via
+        // supervisor.health. compactCount tracks SDK auto-compaction events
+        // observed during this runtime's lifetime; lastActivityAt is the
+        // wall-clock ms of the most recent successful turn end; createdAt is
+        // session-start time. All used by the Java PairStatusPusher.
+        this.compactCount = 0;
+        this.lastCompactAt = null;
+        this.createdAt = Date.now();
+        this.lastActivityAt = Date.now();
     }
 }
 
@@ -178,6 +272,13 @@ export async function startSupervisorSession(params) {
         model,
         allowedTools,
         autoCompactThreshold,
+        // Phase 4 (2026-05-24): rotation-aware extras. The Java
+        // RotationCoordinator passes successorPromptAppend (rendered handoff
+        // doc + behavioural directives) on every generation > 0 start.
+        // generation is informational — printed in diagnostics, may be used
+        // by Phase 5+ for telemetry filtering.
+        successorPromptAppend,
+        generation,
     } = params || {};
 
     if (!pairId || !supervisorId) {
@@ -202,10 +303,25 @@ export async function startSupervisorSession(params) {
     if (runtimes.has(k)) {
         // Idempotent: if already alive, return early.
         process.stdout.write(`[supervisor] session already running: ${k}\n`);
-        return { alreadyRunning: true };
+        return {
+            alreadyRunning: true,
+            protocolVersion: PROTOCOL_VERSION,
+            supportedProtocolVersions: SUPPORTED_PROTOCOL_VERSIONS,
+        };
     }
 
-    const systemPrompt = buildSystemPrompt({ name, description, planContent, specContent });
+    let systemPrompt = buildSystemPrompt({ name, description, planContent, specContent });
+    // Phase 4: append the rendered handoff / bootstrap appendix so the
+    // generation > 0 supervisor reads its inheritance inline with BASE.
+    // BASE itself is always rebuilt from the same configuration, so the
+    // user's persona text never drifts across generations.
+    if (successorPromptAppend && typeof successorPromptAppend === 'string'
+            && successorPromptAppend.length > 0) {
+        systemPrompt = systemPrompt + '\n\n' + successorPromptAppend;
+        process.stdout.write(
+            `[supervisor] gen=${generation ?? '?'} successorPromptAppend bytes=${successorPromptAppend.length}\n`
+        );
+    }
 
     const [sdk, zod] = await Promise.all([loadClaudeSdk(), loadZod()]);
     const queryFn = sdk?.query;
@@ -224,16 +340,25 @@ export async function startSupervisorSession(params) {
 
     // Build the in-process MCP server. The handler captures the validated
     // action onto the runtime; collectAssistantTurn reads it after the turn.
-    const supervisorMcpServer = buildSupervisorMcpServer(sdk, zod, (action) => {
-        runtime.lastCapturedAction = action;
-    });
+    // Phase 3 (2026-05-24): pass runtimeRef so the server also exposes
+    // update_state — emits [STATE_UPDATE] lines that Java's L2Store consumes.
+    const supervisorMcpServer = buildSupervisorMcpServer(
+        sdk,
+        zod,
+        (action) => { runtime.lastCapturedAction = action; },
+        { pairId: runtime.pairId, supervisorId: runtime.supervisorId }
+    );
 
-    // Allow emit_action + read-only file tools by default; callers may opt-in
-    // to extra tools. Read/Glob/Grep are required by the v3 supervisor prompt
-    // to perform in-turn code review (see SUPERVISOR_READ_TOOLS comment).
+    // Allow emit_action + update_state + save_plan + read-only file tools +
+    // Task (subagent dispatch) by default. Protocol v2: supervisor now owns
+    // its own subagents for review/manifest-extraction, removing the legacy
+    // "let the main AI dispatch reviewers" indirection.
     const allowedToolList = [
         QUALIFIED_EMIT_ACTION,
+        QUALIFIED_UPDATE_STATE,
+        QUALIFIED_SAVE_PLAN,
         ...SUPERVISOR_READ_TOOLS,
+        ...SUPERVISOR_AGENT_TOOLS,
         ...runtime.allowedTools,
     ];
 
@@ -252,13 +377,35 @@ export async function startSupervisorSession(params) {
             systemPrompt: runtime.systemPrompt,
             mcpServers: { [SUPERVISOR_MCP_NAME]: supervisorMcpServer },
             allowedTools: allowedToolList,
-            // Defensive allowlist: pre-approve emit_action, deny everything else
-            // even if it slips into allowedTools by mistake.
+            // Phase 3 (2026-05-24): register PreCompact hook so the SDK
+            // pings us before auto-compacting; the Java side dumps an L2
+            // snapshot per emission for rotation-fallback safety.
+            hooks: {
+                PreCompact: [{
+                    hooks: [buildPreCompactHook({
+                        pairId: runtime.pairId,
+                        supervisorId: runtime.supervisorId,
+                    })],
+                }],
+            },
+            // Defensive allowlist: pre-approve emit_action / update_state /
+            // save_plan / read-only file tools / Task. Deny everything else
+            // even if it slips into allowedTools by mistake. Note we never
+            // allow Edit/Write/Bash here — only the main AI edits.
             canUseTool: async (toolName) => {
                 if (toolName === QUALIFIED_EMIT_ACTION) {
                     return { behavior: 'allow' };
                 }
+                if (toolName === QUALIFIED_UPDATE_STATE) {
+                    return { behavior: 'allow' };
+                }
+                if (toolName === QUALIFIED_SAVE_PLAN) {
+                    return { behavior: 'allow' };
+                }
                 if (SUPERVISOR_READ_TOOLS.includes(toolName)) {
+                    return { behavior: 'allow' };
+                }
+                if (SUPERVISOR_AGENT_TOOLS.includes(toolName)) {
                     return { behavior: 'allow' };
                 }
                 if (runtime.allowedTools.includes(toolName)) {
@@ -266,15 +413,24 @@ export async function startSupervisorSession(params) {
                 }
                 return {
                     behavior: 'deny',
-                    message: `Supervisor sessions may only call ${QUALIFIED_EMIT_ACTION} or read-only file tools (Read/Glob/Grep).`,
+                    message: `Supervisor sessions may only call ${QUALIFIED_EMIT_ACTION} / ${QUALIFIED_UPDATE_STATE} / ${QUALIFIED_SAVE_PLAN}, Task (subagent dispatch), or read-only file tools (Read/Glob/Grep).`,
                 };
             },
         },
     });
 
     runtimes.set(k, runtime);
-    process.stdout.write(`[supervisor] started: ${k} (model=${runtime.model})\n`);
-    return { started: true, key: k };
+    process.stdout.write(`[supervisor] started: ${k} (model=${runtime.model}, protocol=${PROTOCOL_VERSION})\n`);
+    // Appendix B (plan §附录 B): advertise the protocol set so the Java client
+    // can pick one it understands. No v1 fallback is wired today — daemon and
+    // Java both code to v2 only — but logging it gives a clean handle for
+    // future mismatches (or for the user to confirm the daemon is up to date).
+    return {
+        started: true,
+        key: k,
+        protocolVersion: PROTOCOL_VERSION,
+        supportedProtocolVersions: SUPPORTED_PROTOCOL_VERSIONS,
+    };
 }
 
 /**
@@ -355,11 +511,324 @@ export async function postEventToSupervisor(params) {
         //   { "id": "<reqId>", "line": "[SUPERVISOR_ACTION] {...}" }
         process.stdout.write('[SUPERVISOR_ACTION] ' + JSON.stringify(wrapper) + '\n');
 
+        // 2026-05-24 (Q4 trace): log inject_prompt actions written to IPC so we
+        // can correlate the daemon write with Java's ActionRouter receipt. If
+        // Java says it never saw an inject_prompt while this line shows one,
+        // the IPC demuxer is dropping the message.
+        const actionType = wrapper.action && wrapper.action.action;
+        if (actionType === 'inject_prompt' || actionType === 'retry_with_hint') {
+            const p = (wrapper.action && wrapper.action.payload) || {};
+            console.error(
+                `[INJECT_TRACE] daemon wrote [SUPERVISOR_ACTION] `
+                + `action=${actionType} directiveId=${p.directiveId || '(none)'} `
+                + `turnId=${wrapper.turnId || '?'} parseError=${wrapper.parseError || 'null'}`
+            );
+        }
+
+        // Phase 2: track liveness for supervisor.health.
+        runtime.lastActivityAt = Date.now();
+
         return { ok: true };
     } finally {
         runtime.currentTurnId = null;
         release();
     }
+}
+
+/**
+ * Phase 4 (2026-05-24): run one supervisor turn driven by the Java-provided
+ * producer prompt; extract the model's JSON output and emit it back as a
+ * {@code [HANDOFF_DOC]} envelope for the rotation coordinator to parse.
+ *
+ * <p>Differs from {@code postEventToSupervisor} in three ways:
+ * <ul>
+ *   <li>Caller-controlled user message (the producer prompt) instead of a
+ *       summarised event.</li>
+ *   <li>Output is the assistant's prose JSON, not an {@code emit_action}
+ *       capture. We deliberately do NOT clear {@code lastCapturedAction}
+ *       afterwards in case the model also called emit_action — but rotation
+ *       discards that on purpose.</li>
+ *   <li>Tagged response prefix is {@code [HANDOFF_DOC]} rather than
+ *       {@code [SUPERVISOR_ACTION]}.</li>
+ * </ul>
+ *
+ * <p>Best-effort JSON extraction:
+ * <ol>
+ *   <li>Strip ```json ... ``` code fences if present.</li>
+ *   <li>Take the first {@code {} ... {@code }} balanced block.</li>
+ *   <li>If parsing fails, still emit the envelope with {@code valid: false}
+ *       so Java surfaces a precise error to the rotation coordinator (which
+ *       then retries with the validation-error prompt variant).</li>
+ * </ol>
+ */
+export async function produceHandoffForSupervisor(params) {
+    const { pairId, supervisorId, prompt } = params || {};
+    if (!pairId || !supervisorId) {
+        throw new Error('supervisor.produceHandoff requires pairId and supervisorId');
+    }
+    if (typeof prompt !== 'string' || prompt.length === 0) {
+        throw new Error('supervisor.produceHandoff requires non-empty prompt');
+    }
+
+    const runtime = runtimes.get(key(pairId, supervisorId));
+    if (!runtime || runtime.disposed) {
+        const err = new Error(
+            `SUPERVISOR_NOT_FOUND supervisor session not found or disposed: ${pairId}:${supervisorId}`
+        );
+        err.code = 'SUPERVISOR_NOT_FOUND';
+        throw err;
+    }
+
+    // Serialise with other postEvent turns on the same runtime.
+    const prev = runtime.busy;
+    let release;
+    runtime.busy = new Promise((resolve) => { release = resolve; });
+
+    try {
+        await prev;
+
+        runtime.lastCapturedAction = null;
+        const turnId = `handoff_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        runtime.currentTurnId = turnId;
+
+        runtime.inputStream.enqueue({
+            type: 'user',
+            session_id: '',
+            parent_tool_use_id: null,
+            message: {
+                role: 'user',
+                content: [{ type: 'text', text: prompt }],
+            },
+        });
+
+        const turn = await collectAssistantTurn(runtime);
+        const raw = (turn.assistantText || '').trim();
+        const extracted = extractFirstJsonBlock(raw);
+        let envelope;
+        if (extracted == null) {
+            envelope = {
+                pairId, supervisorId, turnId,
+                valid: false,
+                error: 'no JSON block found in assistant output',
+                raw,
+                json: null,
+            };
+        } else {
+            envelope = {
+                pairId, supervisorId, turnId,
+                valid: true,
+                json: extracted,
+                raw,
+            };
+        }
+        process.stdout.write('[HANDOFF_DOC] ' + JSON.stringify(envelope) + '\n');
+
+        runtime.lastActivityAt = Date.now();
+        return { ok: true };
+    } finally {
+        runtime.currentTurnId = null;
+        release();
+    }
+}
+
+/**
+ * Best-effort: take the largest balanced {...} block from a string. Strips
+ * markdown ```json fences first. Returns the JSON SUBSTRING (not parsed) —
+ * Java parses + validates on its side so we don't double-decode.
+ */
+function extractFirstJsonBlock(text) {
+    if (!text) return null;
+    let s = text;
+    // Strip ```json or ``` fences
+    const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fence) {
+        s = fence[1];
+    }
+    // Find first { and matching } using a depth counter
+    const start = s.indexOf('{');
+    if (start < 0) return null;
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = start; i < s.length; i++) {
+        const ch = s[i];
+        if (inString) {
+            if (escape) { escape = false; continue; }
+            if (ch === '\\') { escape = true; continue; }
+            if (ch === '"') { inString = false; }
+            continue;
+        }
+        if (ch === '"') { inString = true; continue; }
+        if (ch === '{') depth++;
+        else if (ch === '}') {
+            depth--;
+            if (depth === 0) {
+                return s.slice(start, i + 1);
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * Phase 2 (2026-05-24): query the SDK's real context-window usage breakdown
+ * for a supervisor session. Writes a `[CONTEXT_USAGE]` line tagged with the
+ * active request id so the Java SupervisorBridge can resolve a Future with
+ * the parsed payload.
+ *
+ * <p>The SDK method is named {@code getContextUsage} on the Query interface
+ * (sdk.d.ts line 2167). It returns category-bucketed token counts (system
+ * prompt / tools / messages / memory / mcp), the total, and the model's
+ * context window — much more accurate than our existing input+output rollup.
+ */
+export async function getSupervisorContextUsage(params) {
+    const { pairId, supervisorId } = params || {};
+    if (!pairId || !supervisorId) {
+        throw new Error('supervisor.getContextUsage requires pairId and supervisorId');
+    }
+    const runtime = runtimes.get(key(pairId, supervisorId));
+    if (!runtime || runtime.disposed) {
+        const err = new Error(
+            `SUPERVISOR_NOT_FOUND supervisor session not found or disposed: ${pairId}:${supervisorId}`
+        );
+        err.code = 'SUPERVISOR_NOT_FOUND';
+        throw err;
+    }
+    if (!runtime.query || typeof runtime.query.getContextUsage !== 'function') {
+        const err = new Error('Loaded SDK does not expose Query.getContextUsage');
+        err.code = 'SDK_FEATURE_UNAVAILABLE';
+        throw err;
+    }
+    // Race against a short timeout — getContextUsage is a control request
+    // (round-trips to the CLI host) so a stuck CLI should not hang our health
+    // check forever.
+    const usage = await Promise.race([
+        runtime.query.getContextUsage(),
+        new Promise((_, reject) => setTimeout(
+            () => reject(new Error('SUPERVISOR_CONTEXT_USAGE_TIMEOUT')), 8_000
+        )),
+    ]);
+
+    // Try to compute a 0..1 ratio. SDK shape varies across versions; defend
+    // against missing fields by walking common candidates.
+    const totalUsed = pickNum(usage, ['totalTokens', 'total', 'usedTokens']);
+    const contextLimit = pickNum(usage, ['contextLimit', 'maxTokens', 'limit', 'windowSize']);
+    const ratio = (totalUsed != null && contextLimit > 0)
+        ? Math.min(1, totalUsed / contextLimit)
+        : null;
+
+    const line = {
+        pairId,
+        supervisorId,
+        ts: Date.now(),
+        ratio,
+        totalUsed,
+        contextLimit,
+        breakdown: usage,
+    };
+    process.stdout.write('[CONTEXT_USAGE] ' + JSON.stringify(line) + '\n');
+    return { ok: true };
+}
+
+function pickNum(obj, keys) {
+    if (!obj || typeof obj !== 'object') return null;
+    for (const k of keys) {
+        const v = obj[k];
+        if (typeof v === 'number' && Number.isFinite(v)) return v;
+    }
+    return null;
+}
+
+/**
+ * Phase 2: synthesise a single-shot health snapshot for the Pair status
+ * panel. Includes liveness, runtime age, compaction tally, and the current
+ * inputStream pending size — does NOT call into the SDK (cheap, safe to
+ * call every tick even if the supervisor is mid-turn).
+ *
+ * <p>For a richer snapshot that includes real context usage, callers should
+ * make a second `supervisor.getContextUsage` round-trip; we keep them
+ * separate because getContextUsage is a control request that may stall.
+ */
+export async function getSupervisorHealth(params) {
+    const { pairId, supervisorId } = params || {};
+    if (!pairId || !supervisorId) {
+        throw new Error('supervisor.health requires pairId and supervisorId');
+    }
+    const runtime = runtimes.get(key(pairId, supervisorId));
+    const now = Date.now();
+    let line;
+    if (!runtime || runtime.disposed) {
+        line = {
+            pairId,
+            supervisorId,
+            ts: now,
+            alive: false,
+        };
+    } else {
+        line = {
+            pairId,
+            supervisorId,
+            ts: now,
+            alive: true,
+            createdAt: runtime.createdAt,
+            ageMs: now - runtime.createdAt,
+            lastActivityAt: runtime.lastActivityAt,
+            inactiveMs: now - (runtime.lastActivityAt || runtime.createdAt),
+            compactCount: runtime.compactCount || 0,
+            lastCompactAt: runtime.lastCompactAt,
+            inputStreamPending: typeof runtime.inputStream?.size === 'function'
+                ? runtime.inputStream.size() : null,
+            inputStreamDropped: typeof runtime.inputStream?.droppedCount === 'function'
+                ? runtime.inputStream.droppedCount() : null,
+            currentTurnInProgress: runtime.currentTurnId != null,
+            model: runtime.model,
+        };
+    }
+    process.stdout.write('[SUPERVISOR_HEALTH] ' + JSON.stringify(line) + '\n');
+    return { ok: true };
+}
+
+/**
+ * Phase 2: best-effort interrupt of the currently-running supervisor turn.
+ * Used by the monitor when a tick times out (Phase 1 sets health=DEGRADED
+ * and would benefit from interrupting before the next round). The SDK
+ * documents {@code Query.interrupt} as only valid in streaming-input mode,
+ * which the supervisor channel always uses.
+ */
+export async function interruptSupervisor(params) {
+    const { pairId, supervisorId } = params || {};
+    if (!pairId || !supervisorId) {
+        throw new Error('supervisor.interrupt requires pairId and supervisorId');
+    }
+    const runtime = runtimes.get(key(pairId, supervisorId));
+    if (!runtime || runtime.disposed) {
+        const err = new Error(
+            `SUPERVISOR_NOT_FOUND supervisor session not found or disposed: ${pairId}:${supervisorId}`
+        );
+        err.code = 'SUPERVISOR_NOT_FOUND';
+        throw err;
+    }
+    let interrupted = false;
+    let error = null;
+    if (typeof runtime.query?.interrupt === 'function') {
+        try {
+            await Promise.race([
+                runtime.query.interrupt(),
+                new Promise((_, reject) => setTimeout(
+                    () => reject(new Error('INTERRUPT_TIMEOUT')), 5_000
+                )),
+            ]);
+            interrupted = true;
+        } catch (e) {
+            error = e?.message || String(e);
+        }
+    } else {
+        error = 'SDK does not expose Query.interrupt';
+    }
+    process.stdout.write('[SUPERVISOR_INTERRUPT_RESULT] ' + JSON.stringify({
+        pairId, supervisorId, ts: Date.now(), interrupted, error,
+    }) + '\n');
+    return { ok: true };
 }
 
 /**
@@ -432,16 +901,57 @@ async function collectAssistantTurn(runtime) {
     // usage fields are present) so when the user reports "0% never moves"
     // we can post-mortem the daemon log without guessing.
     const seenTypes = [];
+    // 2026-05-25 (FUNDAMENTAL FIX): per-frame timing + previous-frame kind
+    // are kept ONLY for diagnostic logging. They no longer drive timeouts;
+    // the active path waits as long as the SDK takes. See header comment on
+    // QUERY_NEXT_TIMEOUT_MS for the design rationale.
+    const turnStartMs = Date.now();
+    let lastFrameMs = turnStartMs;
+    let prevFrameKind = 'init'; // init | tool_use | compact | text | result | other
+    let lastToolUseName = null;
     while (true) {
         if (runtime.disposed) {
             throw new Error('Supervisor runtime disposed mid-turn');
         }
         let next;
+        // Stage is logged only — by default we await unbounded. Env-opted-in
+        // wall-clock caps are honoured by nextWithOptionalTimeout (emergency
+        // rollback knob; not used in default deployments).
+        const stage = prevFrameKind === 'compact' ? 'after_compact'
+            : prevFrameKind === 'tool_use' ? 'after_tool_use'
+            : 'default';
+        const frameTimeoutMs = stage === 'after_compact' ? QUERY_NEXT_TIMEOUT_AFTER_COMPACT_MS
+            : stage === 'after_tool_use' ? QUERY_NEXT_TIMEOUT_AFTER_TOOL_USE_MS
+            : QUERY_NEXT_TIMEOUT_MS;
         try {
-            next = await runtime.query.next();
+            next = await nextWithOptionalTimeout(runtime.query, frameTimeoutMs, stage);
         } catch (err) {
-            throw new Error('Supervisor SDK iteration failed: ' + (err?.message ?? String(err)));
+            const msg = err?.message ?? String(err);
+            if (msg.startsWith('SUPERVISOR_QUERY_TIMEOUT')) {
+                // Env-opted-in cap actually fired — surface diagnostic, do
+                // NOT cancel the SDK iterator (the operator chose this knob
+                // explicitly and the next postEvent will still be serviced).
+                const elapsedMs = Date.now() - turnStartMs;
+                const sinceLastFrameMs = Date.now() - lastFrameMs;
+                console.error(
+                    `[supervisor-diag] ENV_TIMEOUT stage=${stage} frame_cap=${frameTimeoutMs}ms `
+                    + `prev_frame=${prevFrameKind}${lastToolUseName ? `(${lastToolUseName})` : ''} `
+                    + `since_last_frame=${sinceLastFrameMs}ms turn_elapsed=${elapsedMs}ms `
+                    + `pair=${runtime.pairId} supervisor=${runtime.supervisorId} `
+                    + `seen=[${seenTypes.slice(-10).join(', ')}]`
+                );
+                try { if (typeof runtime.query?.return === 'function') runtime.query.return(); }
+                catch { /* ignore */ }
+                const e = new Error('SUPERVISOR_QUERY_TIMEOUT: ' + msg);
+                e.code = 'SUPERVISOR_QUERY_TIMEOUT';
+                throw e;
+            }
+            // Real SDK-layer error (network failure, malformed response, etc).
+            // Bubble it; do NOT synthesize a generic timeout error.
+            throw new Error('Supervisor SDK iteration failed: ' + msg);
         }
+        // A frame returned — reset heartbeat (for the diagnostic log).
+        lastFrameMs = Date.now();
         if (next?.done) break;
 
         const msg = next.value;
@@ -464,6 +974,7 @@ async function collectAssistantTurn(runtime) {
         streamSdkMessage(runtime, msg);
 
         if (msg.type === 'assistant' && msg.message?.content) {
+            let sawToolUse = false;
             for (const block of msg.message.content) {
                 if (!block || typeof block !== 'object') continue;
                 if (block.type === 'text' && typeof block.text === 'string') {
@@ -494,10 +1005,22 @@ async function collectAssistantTurn(runtime) {
                         pendingTools.set(block.id, entry);
                         toolEvents.push(entry);
                     }
+                    // 2026-05-24 (Q1): even emit_action counts as a tool_use
+                    // for next-frame timing — the SDK still needs to deliver
+                    // the tool_result on the next frame, which is normally fast
+                    // but can be slow under load. Track ALL tool calls.
+                    sawToolUse = true;
+                    if (typeof block.name === 'string') lastToolUseName = block.name;
                 }
             }
             // Per-message usage rollup, in case the result message doesn't carry one.
             if (msg.message.usage) lastUsage = msg.message.usage;
+            // 2026-05-24 (Q1): if this assistant frame dispatched a tool, the
+            // NEXT next() call is waiting for the tool to run + its result to
+            // be delivered. Read/Glob/Grep finish in seconds, but Task subagents
+            // can take minutes — use the heavier cap. Pure text/thinking frames
+            // get the default cap (model just keeps producing).
+            prevFrameKind = sawToolUse ? 'tool_use' : 'text';
         } else if (msg.type === 'user' && msg.message?.content) {
             // tool_result blocks come back as user-role messages in the SDK
             // stream. Match them to the pending tool_use by id and attach
@@ -511,6 +1034,10 @@ async function collectAssistantTurn(runtime) {
                 pending.result = summarizeToolResult(block);
                 pendingTools.delete(block.tool_use_id);
             }
+            // Model now needs to react to the tool result — usually fast,
+            // but on heavy results (Task subagent returning a 50KB manifest)
+            // it can think for a while. Keep default cap.
+            prevFrameKind = 'tool_result';
         } else if (msg.type === 'system' && msg.subtype === 'compact_boundary') {
             // CLI auto-compaction event — the conversation history was just
             // summarised down to fit the model's context window. We pass the
@@ -520,9 +1047,34 @@ async function collectAssistantTurn(runtime) {
                 trigger: msg.compact_metadata?.trigger || 'auto',
                 preTokens: msg.compact_metadata?.pre_tokens ?? null,
             });
+            // Phase 2 (2026-05-24): also surface compaction as a discrete
+            // tagged stdout line so the Java SupervisorBridge can keep a
+            // per-pair compactCount counter — used by the rotation triggers
+            // in Phase 5. The line is request-id-tagged automatically by
+            // daemon.js since collectAssistantTurn runs inside the active
+            // postEvent request.
+            try {
+                process.stdout.write(`[COMPACT_BOUNDARY] ${JSON.stringify({
+                    pairId: runtime.pairId,
+                    supervisorId: runtime.supervisorId,
+                    ts: Date.now(),
+                    trigger: msg.compact_metadata?.trigger || 'auto',
+                    preTokens: msg.compact_metadata?.pre_tokens ?? null,
+                })}\n`);
+            } catch (_) { /* stdout closed */ }
+            // Update the runtime's compaction tally — accessed by the
+            // supervisor.health endpoint.
+            runtime.compactCount = (runtime.compactCount || 0) + 1;
+            runtime.lastCompactAt = Date.now();
+            // 2026-05-24 (Q1): post-compaction the model has to re-process its
+            // entire (now compressed) history before producing the next frame
+            // — give it more headroom.
+            prevFrameKind = 'compact';
         } else if (msg.type === 'result') {
             if (msg.usage) lastUsage = msg.usage;
             break;
+        } else {
+            prevFrameKind = 'other';
         }
     }
     // One-line per-turn diagnostic. Goes to daemon stderr via console.error
@@ -530,9 +1082,11 @@ async function collectAssistantTurn(runtime) {
     // a request-tagged stdout line — so it doesn't pollute the IPC stream).
     // Read it via the IDE's daemon-stderr log when triaging "0% never moves"
     // or "no tool cards" complaints.
+    const turnDurMs = Date.now() - turnStartMs;
     console.error(
-        `[supervisor-diag] turn complete: msgs=[${seenTypes.join(', ')}] `
+        `[supervisor-diag] turn complete: dur=${turnDurMs}ms msgs=[${seenTypes.join(', ')}] `
         + `tools=${toolEvents.length} compact=${compactEvents.length} `
+        + `captured_action=${runtime.lastCapturedAction ? runtime.lastCapturedAction.action : 'null'} `
         + `usage=${lastUsage ? JSON.stringify(lastUsage) : 'null'}`
     );
     if (toolEvents.length > 0) {
@@ -687,12 +1241,18 @@ function normaliseUsage(usage) {
  */
 function buildActionWrapper({ pairId, supervisorId, assistantText, reasoningText, capturedAction }) {
     if (capturedAction) {
+        // Protocol v2 (2026-05-24): surface directiveId at the wrapper top so
+        // Java's ActionRouter + DirectiveTracker can correlate without diving
+        // into payload. Only inject_prompt / retry_with_hint get a directiveId
+        // (assigned by normalizeAction); other actions stay null.
+        const directiveId = capturedAction?.payload?.directiveId || null;
         return {
             pairId,
             supervisorId,
             naturalText: '',
             reasoningText: '',
             action: capturedAction,
+            directiveId,
             parseError: null,
             rawText: JSON.stringify(capturedAction),
         };
@@ -708,6 +1268,7 @@ function buildActionWrapper({ pairId, supervisorId, assistantText, reasoningText
             reason: '(downgraded) supervisor did not call emit_action this turn',
             payload: {},
         },
+        directiveId: null,
         parseError: 'no_tool_use',
         rawText: assistantText,
     };

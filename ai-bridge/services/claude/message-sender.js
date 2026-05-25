@@ -125,11 +125,21 @@ async function loadSdkQueryFunction(logPrefix) {
 /**
  * Build the systemPrompt.append content from opened files and agent prompt.
  */
-function buildSystemPromptAppend(openedFiles, agentPrompt, message) {
+function buildSystemPromptAppend(openedFiles, agentPrompt, message, rotationAppend = null) {
+  let baseAppend;
   if (openedFiles && openedFiles.isQuickFix) {
-    return buildQuickFixPrompt(openedFiles, message);
+    baseAppend = buildQuickFixPrompt(openedFiles, message);
+  } else {
+    baseAppend = buildIDEContextPrompt(openedFiles, agentPrompt);
   }
-  return buildIDEContextPrompt(openedFiles, agentPrompt);
+  // Phase 6c (2026-05-24): main-AI rotation handoff. Concatenated with (not
+  // replacing) the IDE/agentPrompt append so the new post-rotation runtime
+  // keeps the agent persona AND gets the handoff doc. See the persistent
+  // path's buildSystemPromptAppend for the matching daemon-mode behaviour.
+  const hasRotation = typeof rotationAppend === 'string' && rotationAppend.trim() !== '';
+  if (!hasRotation) return baseAppend;
+  if (!baseAppend || baseAppend.trim() === '') return rotationAppend;
+  return rotationAppend + '\n\n---\n\n' + baseAppend;
 }
 
 /**
@@ -403,7 +413,7 @@ function handleSendError(error, streamState, sdkStderrLines) {
  * @param {string} agentPrompt - Agent prompt (optional)
  * @param {boolean} streaming - Whether to enable streaming (optional, defaults to config value)
  */
-export async function sendMessage(message, resumeSessionId = null, cwd = null, permissionMode = null, model = null, openedFiles = null, agentPrompt = null, streaming = null, disableThinking = false, reasoningEffort = null) {
+export async function sendMessage(message, resumeSessionId = null, cwd = null, permissionMode = null, model = null, openedFiles = null, agentPrompt = null, streaming = null, disableThinking = false, reasoningEffort = null, rotationAppend = null) {
   console.log('[DIAG] ========== sendMessage() START ==========');
   console.log('[DIAG] params:', { msgLen: message ? message.length : 0, resumeSessionId: resumeSessionId || '(new)', cwd, permissionMode, model, reasoningEffort });
 
@@ -428,7 +438,7 @@ export async function sendMessage(message, resumeSessionId = null, cwd = null, p
     console.log('[DEBUG] Model:', model, '->', sdkModelName, '(API:', resolvedModel + ')');
     setModelEnvironmentVariables(resolvedModel, model);
 
-    const systemPromptAppend = buildSystemPromptAppend(openedFiles, agentPrompt, message);
+    const systemPromptAppend = buildSystemPromptAppend(openedFiles, agentPrompt, message, rotationAppend);
 
     const effectivePermissionMode = (!permissionMode || permissionMode === '') ? 'default' : permissionMode;
     const normalizedReasoningEffort = normalizeReasoningEffort(reasoningEffort);
@@ -489,8 +499,11 @@ export async function sendMessageWithAttachments(message, resumeSessionId = null
     const attachments = await loadAttachments(stdinData);
     const openedFiles = stdinData?.openedFiles || null;
     const agentPrompt = stdinData?.agentPrompt || null;
+    const rotationAppend = (typeof stdinData?.systemPromptAppend === 'string' && stdinData.systemPromptAppend.trim() !== '')
+      ? stdinData.systemPromptAppend
+      : null;
 
-    const systemPromptAppend = buildSystemPromptAppend(openedFiles, agentPrompt, message);
+    const systemPromptAppend = buildSystemPromptAppend(openedFiles, agentPrompt, message, rotationAppend);
 
     const contentBlocks = buildContentBlocks(attachments, message);
     const userMessage = {

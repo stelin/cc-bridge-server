@@ -31,6 +31,10 @@ import {
   postEventToSupervisor,
   stopSupervisorSession,
   stopAllSupervisorSessions,
+  getSupervisorContextUsage,
+  getSupervisorHealth,
+  interruptSupervisor,
+  produceHandoffForSupervisor,
 } from './channels/supervisor-channel.js';
 import { loadClaudeSdk, isClaudeSdkAvailable } from './utils/sdk-loader.js';
 import {
@@ -39,7 +43,9 @@ import {
   preconnectPersistent,
   shutdownPersistentRuntimes,
   abortCurrentTurn,
-  resetRuntimePersistent
+  resetRuntimePersistent,
+  produceHandoffForMainAI,
+  getMainAIContextUsage,
 } from './services/claude/persistent-query-service.js';
 import { injectNetworkEnvVars } from './config/api-config.js';
 
@@ -349,16 +355,38 @@ async function processRequest(request) {
       await preconnectPersistent(stdinData);
     } else if (provider === 'claude' && command === 'resetRuntime') {
       await resetRuntimePersistent(stdinData);
+    } else if (provider === 'mainAi' && command === 'produceHandoff') {
+      // Phase 6b (2026-05-24): produce a handoff JSON from the running
+      // main-AI session so the rotation coordinator can carry context
+      // (recent user messages verbatim, plan progress, file state, etc.)
+      // into the next generation.
+      await produceHandoffForMainAI(stdinData);
+    } else if (provider === 'mainAi' && command === 'getContextUsage') {
+      // Phase 6b: real SDK getContextUsage for the main-AI runtime tied
+      // to {@code sessionId}. Used by MainAIMonitor.updateContextUsage to
+      // replace the existing token-rollup estimate with a precise ratio.
+      await getMainAIContextUsage(stdinData);
     } else if (provider === 'supervisor') {
-      // Supervisor commands: start / postEvent / stop.
-      // They share the same NDJSON envelope; output (ACTION lines) is written
-      // via the standard process.stdout, which gets tagged with the request id.
+      // Supervisor commands: start / postEvent / stop / (Phase 2) health /
+      // getContextUsage / interrupt. All share the same NDJSON envelope;
+      // tagged stdout lines (e.g. [CONTEXT_USAGE], [SUPERVISOR_HEALTH])
+      // carry the response payload back to the Java side.
       if (command === 'start') {
         await startSupervisorSession(stdinData);
       } else if (command === 'postEvent') {
         await postEventToSupervisor(stdinData);
       } else if (command === 'stop') {
         await stopSupervisorSession(stdinData);
+      } else if (command === 'getContextUsage') {
+        await getSupervisorContextUsage(stdinData);
+      } else if (command === 'health') {
+        await getSupervisorHealth(stdinData);
+      } else if (command === 'interrupt') {
+        await interruptSupervisor(stdinData);
+      } else if (command === 'produceHandoff') {
+        // Phase 4 (2026-05-24): rotation pipeline asks the current supervisor
+        // to emit a structured handoff JSON via a one-turn round-trip.
+        await produceHandoffForSupervisor(stdinData);
       } else {
         throw new Error(`Unknown supervisor command: ${command}`);
       }

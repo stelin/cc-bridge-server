@@ -77,13 +77,120 @@ function resolveStreamingEnabled(params, settings) {
     : (settings?.streamingEnabled ?? false);
 }
 
+/**
+ * Protocol v2 (2026-05-24): Pair-mode system prompt append. Inlined from
+ * `jetbrains-cc-gui/src/main/resources/main-ai-system-prompt-append.md`.
+ * If you edit this string you MUST also update that .md file (and vice versa)
+ * — the .md is the human-readable canonical source; this copy is the runtime
+ * shipper. Phase 5+ will move to a single shared source.
+ *
+ * Kept short here on purpose — long instructions live in the .md, but the
+ * critical contract that the main AI MUST call report_turn_completion is
+ * the load-bearing part for this protocol to work.
+ */
+const PAIR_MODE_SYSTEM_PROMPT_APPEND = [
+  '# Supervisor Pair 模式约束',
+  '',
+  '你现在在 Supervisor Pair 协作模式下工作。supervisor 是你的协作者(类似 PM / 架构师),通过 `inject_prompt` 派任务,你执行后必须**结构化汇报**结果。',
+  '',
+  '## 强约束:每个 turn 必调 `report_turn_completion`',
+  '',
+  '在每个 turn 结束前,你**必须**调用 `mcp__main__report_turn_completion` 工具汇报本轮工作。',
+  '**唯一例外**:本轮只输出了纯对话/澄清/没有任何代码或工具产出的解释性回复时,可以不调用。',
+  '',
+  '工具入参:',
+  '- `summary`: 1-2 句任务级摘要',
+  '- `deliverables`: 你新增/修改的文件清单(相对项目根 POSIX 路径)+ 每个文件 `change` 描述 + 可选 `confidence`',
+  '- `verifications` (可选): 你跑过的命令 + pass/fail + 失败时 stderrTail (<=1KB)',
+  '- `selfAssessment` (必填):',
+  '  - `confidence`: high / medium / low',
+  '  - `concerns`: 你自己觉得不踏实的具体点(空数组表示完全自信)',
+  '  - `suggestedReview` (可选): 建议 supervisor 重点 review 哪里 (如 "user_dao.go:42-58")',
+  '',
+  '## confidence 怎么定',
+  '- **high**: 做完 + verifications 全 pass + 没有 unaddressed concerns → supervisor 信任直接通过',
+  '- **medium**: 主流程对了但某些边界没验证 → supervisor 会自己 Read 验证',
+  '- **low**: 你按指令做了但心里没底 → supervisor 必派 code reviewer 子 agent 重 review',
+  '',
+  '**不要骗 supervisor** — 故意报 high 但实际有问题,后续会被发现,trust 降级到全部强制 reviewer。',
+  '',
+  '## inject_prompt 收到后',
+  'supervisor 派来的 inject_prompt 是结构化任务派单,含 `objective` + `expectedDeliverables` (期望产出路径) + `acceptanceCriteria` (验收标准)。如果含 `spilledPath` (>8KB 指令存在磁盘文件), 先 Read 该路径再执行。',
+  '',
+  '你的 `deliverables` 应覆盖 `expectedDeliverables` 中所有路径(可以多但不能少)。',
+  '',
+  '## 你内部的子 agent',
+  '你**可以**派 Task 子 agent (并行/隔离),这是你的内部行为不需要向 supervisor 解释。supervisor 通过 SubagentStop hook 自动看见子 agent 摘要 + transcript 路径。**但子 agent 的产出也算你的 deliverables**——子 agent 改的文件,你的 `deliverables` 数组也要列。',
+].join('\n');
+
+/**
+ * Protocol v2 (2026-05-24): extract a leading {@code <!--pair-context:{...}-->}
+ * marker from the systemPromptAppend string into a structured pairContext
+ * object. Returns the cleaned remainder (without the marker) so the rest of
+ * the prompt processing sees a normal append. No marker → returns input
+ * unchanged + pairContext null.
+ *
+ * Why a marker instead of a dedicated IPC field: avoids threading a new
+ * parameter through 5 layers of Java IPC (ClaudeSession → SessionSendService →
+ * ClaudeSDKBridge → DaemonRequestExecutor → daemon RPC). One day Phase 5 may
+ * promote this to a clean field; for now the marker is the smallest viable
+ * wiring that lets the Pair-mode hooks + MCP server actually mount.
+ */
+const PAIR_CTX_MARKER_RE = /^<!--pair-context:({[\s\S]+?})-->\r?\n?/;
+function extractInlinedPairContext(systemPromptAppendRaw) {
+  if (typeof systemPromptAppendRaw !== 'string' || systemPromptAppendRaw.length === 0) {
+    return { pairContext: null, cleaned: systemPromptAppendRaw };
+  }
+  const m = systemPromptAppendRaw.match(PAIR_CTX_MARKER_RE);
+  if (!m) return { pairContext: null, cleaned: systemPromptAppendRaw };
+  let parsed = null;
+  try { parsed = JSON.parse(m[1]); } catch (_) { /* malformed, ignore */ }
+  return { pairContext: parsed, cleaned: systemPromptAppendRaw.slice(m[0].length) };
+}
+
 function buildSystemPromptAppend(params) {
   const openedFiles = params.openedFiles || null;
   const agentPrompt = params.agentPrompt || null;
+  // Phase 6c (2026-05-24): main-AI rotation handoff. Staged on the Java side
+  // by ClaudeSession.swapInnerSession and consumed once by SessionSendService.
+  // Concatenated with (not replacing) the IDE/agentPrompt append so the new
+  // post-rotation runtime keeps the agent persona AND gets the handoff doc.
+  // Order: handoff first (highest signal — recent user messages verbatim,
+  // anchored facts, plan progress) — then IDE context. Last block tends to
+  // get weighted heavier by the model, but in practice both are loaded into
+  // the system prompt at the same priority; ordering is a tie-break.
+  // Protocol v2: strip the pair-context marker from systemPromptAppend before
+  // it goes into the model prompt (the marker is bookkeeping, not for the LLM).
+  // The extracted pairContext is consumed by buildRequestContext below.
+  const { pairContext: _ignored, cleaned: cleanedAppend } =
+      extractInlinedPairContext(params.systemPromptAppend);
+  const rotationAppend = (typeof cleanedAppend === 'string' && cleanedAppend.trim() !== '')
+    ? cleanedAppend
+    : null;
+  let baseAppend;
   if (openedFiles && openedFiles.isQuickFix) {
-    return buildQuickFixPrompt(openedFiles, params.message || '');
+    baseAppend = buildQuickFixPrompt(openedFiles, params.message || '');
+  } else {
+    baseAppend = buildIDEContextPrompt(openedFiles, agentPrompt);
   }
-  return buildIDEContextPrompt(openedFiles, agentPrompt);
+
+  // Protocol v2 (2026-05-24): Pair-mode append. Only injected when this send
+  // is for a Pair-mode main AI (caller passed pairContext.pairId). Non-Pair
+  // sends never see this prompt — they keep working without report_turn_completion.
+  const pairAppend = (params.pairContext && typeof params.pairContext === 'object'
+      && typeof params.pairContext.pairId === 'string' && params.pairContext.pairId.length > 0)
+    ? PAIR_MODE_SYSTEM_PROMPT_APPEND
+    : null;
+
+  // Composition order: rotationAppend → baseAppend → pairAppend.
+  // pairAppend goes last so the "must call report_turn_completion" rule is
+  // the freshest in the model's context window when generating the response.
+  const parts = [rotationAppend, baseAppend, pairAppend].filter(
+    (p) => typeof p === 'string' && p.trim().length > 0
+  );
+  if (parts.length === 0) return '';
+  if (parts.length === 1) return parts[0];
+  return parts.join('\n\n---\n\n');
 }
 
 function buildQueryOptions(workingDirectory, sdkModelName, permissionMode, maxThinkingTokens, streamingEnabled, systemPromptAppend, requestedSessionId, reasoningEffort) {
@@ -185,10 +292,44 @@ async function buildRequestContext(params, withAttachments) {
 
   const userMessage = await buildUserMessage(params, withAttachments, requestedSessionId);
 
-  const runtimeSignature = buildRuntimeSignature(options, systemPromptAppend, streamingEnabled, runtimeSessionEpoch);
+  // Protocol v2 (2026-05-24): Pair-mode context. Two sources, in priority:
+  //   1. params.pairContext (explicit IPC field) — preferred, but not yet wired
+  //      through every Java IPC path.
+  //   2. systemPromptAppend marker (Java SessionSendService prepends a
+  //      <!--pair-context:{...}--> marker; we extracted it above into the
+  //      `extractInlinedPairContext` discard variable, re-do it here to take
+  //      the value).
+  // When set the runtime gets SubagentStop hook + mcp__main MCP server.
+  let pairContext = null;
+  if (params.pairContext && typeof params.pairContext === 'object'
+      && typeof params.pairContext.pairId === 'string'
+      && params.pairContext.pairId.length > 0) {
+    pairContext = {
+      pairId: params.pairContext.pairId,
+      activeDirectiveId: typeof params.pairContext.activeDirectiveId === 'string'
+        ? params.pairContext.activeDirectiveId : null,
+    };
+  } else {
+    const { pairContext: markerCtx } = extractInlinedPairContext(params.systemPromptAppend);
+    if (markerCtx && typeof markerCtx.pairId === 'string' && markerCtx.pairId.length > 0) {
+      pairContext = {
+        pairId: markerCtx.pairId,
+        activeDirectiveId: typeof markerCtx.activeDirectiveId === 'string'
+          ? markerCtx.activeDirectiveId : null,
+      };
+    }
+  }
+
+  // Signature includes pairId so a Pair-mode runtime is never reused by a
+  // non-Pair request — they need different hooks + MCP wiring.
+  const runtimeSignature = buildRuntimeSignature(
+    options, systemPromptAppend, streamingEnabled, runtimeSessionEpoch,
+    pairContext?.pairId || null
+  );
   console.log('[LIFECYCLE] buildRequestContext sessionId=' + (requestedSessionId || '(new)')
     + ' epoch=' + (runtimeSessionEpoch || '(none)')
-    + ' signature=' + runtimeSignature);
+    + ' signature=' + runtimeSignature
+    + (pairContext?.pairId ? ' pairId=' + pairContext.pairId : ''));
 
   return {
     requestedSessionId,
@@ -199,7 +340,8 @@ async function buildRequestContext(params, withAttachments) {
     sdkModelName,
     permissionMode,
     maxThinkingTokens,
-    runtimeSignature
+    runtimeSignature,
+    pairContext,
   };
 }
 
@@ -221,6 +363,15 @@ async function executeTurn(runtime, requestContext, turnMeta) {
   setActiveTurnRuntime(runtime);
   console.log('[LIFECYCLE] executeTurn sessionId=' + (requestContext.requestedSessionId || runtime.sessionId || '(new)')
     + ' epoch=' + (requestContext.runtimeSessionEpoch || runtime.runtimeSessionEpoch || '(none)'));
+
+  // Protocol v2 (2026-05-24): refresh per-turn ids so the mcp__main tools
+  // (report_turn_completion) and SubagentStop hook emit lines tagged with the
+  // current turn / directive context. activeDirectiveId is set by Java when
+  // it pushes a directive-bearing send; null for normal user messages.
+  runtime.sessionId = runtime.sessionId || requestContext.requestedSessionId || null;
+  if (requestContext.pairContext) {
+    runtime.activeDirectiveId = requestContext.pairContext.activeDirectiveId || null;
+  }
 
   const turnState = createTurnState(requestContext, runtime);
   if (turnMeta) {
@@ -274,6 +425,24 @@ async function executeTurn(runtime, requestContext, turnMeta) {
       // The Java backend (ClaudeMessageHandler.handleAssistantMessage) relies on this for correct totals.
       emitUsageTag(msg);
       processToolResultMessages(msg);
+
+      // Phase 6b (2026-05-24): mirror the supervisor-channel observation so
+      // the Java MainAIMonitor can count main-AI auto-compactions. The line
+      // is request-id-tagged by daemon.js stdout interception, so it routes
+      // to the active send's callback (ClaudeSDKBridge → MainAIMonitor).
+      if (msg?.type === 'system' && msg.subtype === 'compact_boundary') {
+        try {
+          console.log('[COMPACT_BOUNDARY]', JSON.stringify({
+            sessionId: turnState.finalSessionId
+                    || runtime.sessionId
+                    || requestContext.requestedSessionId
+                    || null,
+            ts: Date.now(),
+            trigger: msg.compact_metadata?.trigger || 'auto',
+            preTokens: msg.compact_metadata?.pre_tokens ?? null,
+          }));
+        } catch (_) { /* stdout closed */ }
+      }
 
       if (msg?.type === 'system' && msg.session_id) {
         turnState.finalSessionId = msg.session_id;
@@ -433,6 +602,206 @@ export async function abortCurrentTurn() {
     // Best-effort — log but don't throw so abort always "succeeds"
     console.error('[ABORT] Failed to dispose runtime:', error.message);
   }
+}
+
+/**
+ * Phase 6b (2026-05-24): produce a handoff JSON document from the main-AI
+ * runtime tied to {@code sessionId}. Mirrors the supervisor flow:
+ *   1. Enqueue {@code prompt} as a one-shot user message.
+ *   2. Drain SDK iteration, collect assistant text + bail on result.
+ *   3. Extract the first balanced {...} block from the assistant prose.
+ *   4. Emit a {@code [HANDOFF_DOC]} line; Java's MainAIRotationCoordinator
+ *      consumes it.
+ *
+ * <p>Differences from {@code produceHandoffForSupervisor}:
+ * <ul>
+ *   <li>Looks up the runtime via the global per-session registry instead of
+ *       a dedicated runtimes Map.</li>
+ *   <li>Does NOT emit [MESSAGE_START] / [STREAM_START] / [USAGE] / etc.,
+ *       because the Java ClaudeMessageHandler would otherwise treat the
+ *       output as a regular user-visible turn.</li>
+ *   <li>Skips registering [SESSION_ID] — the runtime already has a session
+ *       and we don't want the prompt to start a new conversation.</li>
+ * </ul>
+ *
+ * <p>Concurrency: defensively bails if the runtime currently holds an
+ * active turn ({@code beginRuntimeTurn} would throw). The Java coordinator
+ * is expected to schedule this only when the main-AI session is idle.
+ */
+export async function produceHandoffForMainAI(params = {}) {
+  const { sessionId, prompt } = params || {};
+  if (!sessionId || typeof sessionId !== 'string') {
+    throw new Error('mainAi.produceHandoff requires sessionId');
+  }
+  if (!prompt || typeof prompt !== 'string') {
+    throw new Error('mainAi.produceHandoff requires non-empty prompt');
+  }
+
+  const runtime = getRuntimeForSession(sessionId);
+  if (!runtime || runtime.closed) {
+    const err = new Error('MAIN_AI_RUNTIME_NOT_FOUND ' + sessionId);
+    err.code = 'MAIN_AI_RUNTIME_NOT_FOUND';
+    throw err;
+  }
+
+  let acquired = false;
+  try {
+    try {
+      beginRuntimeTurn(runtime);
+      acquired = true;
+    } catch (e) {
+      const err = new Error('MAIN_AI_RUNTIME_BUSY ' + (e?.message || String(e)));
+      err.code = 'MAIN_AI_RUNTIME_BUSY';
+      throw err;
+    }
+
+    runtime.inputStream.enqueue({
+      type: 'user',
+      session_id: sessionId,
+      parent_tool_use_id: null,
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: prompt }],
+      },
+    });
+
+    const textChunks = [];
+    while (true) {
+      let next;
+      try {
+        next = await runtime.query.next();
+      } catch (e) {
+        const err = new Error('MAIN_AI_HANDOFF_ITER_FAILED ' + (e?.message || String(e)));
+        err.code = 'MAIN_AI_HANDOFF_ITER_FAILED';
+        throw err;
+      }
+      if (next.done) break;
+      const msg = next.value;
+      if (!msg) continue;
+
+      // Aggregate assistant text without firing the normal observability tags.
+      // We deliberately ignore stream events to keep the IPC bandwidth low.
+      if (msg.type === 'assistant' && msg.message?.content) {
+        for (const block of msg.message.content) {
+          if (block && block.type === 'text' && typeof block.text === 'string') {
+            textChunks.push(block.text);
+          }
+        }
+      }
+      if (msg.type === 'result') break;
+    }
+
+    const raw = textChunks.join('').trim();
+    const extracted = extractFirstJsonBlockMainAI(raw);
+    const envelope = extracted == null
+      ? {
+          sessionId,
+          ts: Date.now(),
+          valid: false,
+          error: 'no JSON block found in assistant output',
+          raw,
+          json: null,
+        }
+      : {
+          sessionId,
+          ts: Date.now(),
+          valid: true,
+          json: extracted,
+          raw,
+        };
+    console.log('[HANDOFF_DOC]', JSON.stringify(envelope));
+    return { ok: true };
+  } finally {
+    if (acquired) {
+      try { endRuntimeTurn(runtime); } catch (_) { /* ignore */ }
+    }
+  }
+}
+
+/**
+ * Phase 6b: get the SDK's real context-window usage for the main-AI runtime
+ * tied to {@code sessionId}. Emits a {@code [CONTEXT_USAGE]} line consumed
+ * by the Java ClaudeSDKBridge / MainAIMonitor. Cheap; safe to call from
+ * any tick.
+ */
+export async function getMainAIContextUsage(params = {}) {
+  const { sessionId } = params || {};
+  if (!sessionId || typeof sessionId !== 'string') {
+    throw new Error('mainAi.getContextUsage requires sessionId');
+  }
+  const runtime = getRuntimeForSession(sessionId);
+  if (!runtime || runtime.closed) {
+    const err = new Error('MAIN_AI_RUNTIME_NOT_FOUND ' + sessionId);
+    err.code = 'MAIN_AI_RUNTIME_NOT_FOUND';
+    throw err;
+  }
+  if (!runtime.query || typeof runtime.query.getContextUsage !== 'function') {
+    const err = new Error('Loaded SDK does not expose Query.getContextUsage');
+    err.code = 'SDK_FEATURE_UNAVAILABLE';
+    throw err;
+  }
+  const usage = await Promise.race([
+    runtime.query.getContextUsage(),
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error('MAIN_AI_CONTEXT_USAGE_TIMEOUT')), 8_000
+    )),
+  ]);
+  const totalUsed = pickFiniteNumber(usage, ['totalTokens', 'total', 'usedTokens']);
+  const contextLimit = pickFiniteNumber(usage, ['contextLimit', 'maxTokens', 'limit', 'windowSize']);
+  const ratio = (totalUsed != null && contextLimit > 0)
+    ? Math.min(1, totalUsed / contextLimit)
+    : null;
+  console.log('[CONTEXT_USAGE]', JSON.stringify({
+    sessionId,
+    ts: Date.now(),
+    ratio,
+    totalUsed,
+    contextLimit,
+    breakdown: usage,
+  }));
+  return { ok: true };
+}
+
+function pickFiniteNumber(obj, keys) {
+  if (!obj || typeof obj !== 'object') return null;
+  for (const k of keys) {
+    const v = obj[k];
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+  return null;
+}
+
+/**
+ * Best-effort JSON extraction — strip ```json fences and find the largest
+ * balanced {...} block. Mirrors {@code extractFirstJsonBlock} in
+ * supervisor-channel.js (kept separate to avoid cross-file coupling).
+ */
+function extractFirstJsonBlockMainAI(text) {
+  if (!text) return null;
+  let s = text;
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fence) s = fence[1];
+  const start = s.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      if (escape) { escape = false; continue; }
+      if (ch === '\\') { escape = true; continue; }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return s.slice(start, i + 1);
+    }
+  }
+  return null;
 }
 
 export async function shutdownPersistentRuntimes() {
