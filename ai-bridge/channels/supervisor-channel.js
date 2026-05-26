@@ -29,10 +29,14 @@ import { summarizeEvent } from '../services/supervisor/event-summarizer.js';
 import {
     buildSupervisorMcpServer,
     QUALIFIED_EMIT_ACTION,
+    QUALIFIED_DISPATCH_TO_MAIN_AI,
+    QUALIFIED_RETRY_MAIN_AI_WITH_HINT,
     QUALIFIED_UPDATE_STATE,
     QUALIFIED_SAVE_PLAN,
     SUPERVISOR_MCP_NAME,
     EMIT_ACTION_TOOL_NAME,
+    DISPATCH_TO_MAIN_AI_TOOL_NAME,
+    RETRY_MAIN_AI_WITH_HINT_TOOL_NAME,
 } from '../services/supervisor/supervisor-tools.js';
 import { buildPreCompactHook } from '../services/supervisor/pre-compact-hook.js';
 import { PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from '../services/supervisor/protocol-v2.js';
@@ -195,7 +199,8 @@ function buildSystemPrompt({ name, description, planContent, specContent }) {
             '',
             '# 当前任务方案',
             '尚未提供。等待用户在右侧输入框给出任务描述。',
-            '在用户提供任务前，**保持沉默**——除非收到 user_input 事件，否则调用 emit_action 时使用 action="wait"。'
+            '在用户提供任务（user_input 事件）前，**保持沉默**——不要调用任何收尾工具。',
+            '系统会在你不调任何收尾工具时自动 downgrade 为 wait，这是正确的"等用户"状态。'
         );
     }
 
@@ -204,7 +209,7 @@ function buildSystemPrompt({ name, description, planContent, specContent }) {
             '',
             '# 项目适用规范 / 技能包',
             '以下是当前项目启用的规范包。主 AI 每次产出后，把这些当作 review 检查项；',
-            '违反时立即通过 emit_action(action="inject_prompt") 反馈具体违反点（引用规范名 + 文件:行号）。',
+            '违反时立即通过 `retry_main_ai_with_hint` 反馈具体违反点（引用规范名 + 文件:行号）。',
             '',
             specContent.trim()
         );
@@ -212,42 +217,57 @@ function buildSystemPrompt({ name, description, planContent, specContent }) {
 
     sections.push(
         '',
-        '# 你可用的只读工具（必读）',
-        '除 `emit_action` 外，你拥有 **只读** 文件工具：`Read`、`Glob`、`Grep`。',
-        '- 你**没有**写工具——不能调用 Edit / Write / Bash。修改代码靠 inject_prompt 让主 AI 做。',
-        '- 一个 turn 内可以多次调用文件工具，最后调用 **一次** `emit_action` 收尾。',
+        '# 你拥有的工具',
         '',
-        '# 必做：review 协议（强约束）',
+        '## 收尾工具（每个 turn 必须调用且仅调用一个）',
+        '- `dispatch_to_main_ai` — **派新任务给主 AI**。prompt 字段必填（>= 10 字），是主 AI 直接读到的指令。',
+        '- `retry_main_ai_with_hint` — **让主 AI 重试/修正上一次产出**。prompt 字段必填（>= 10 字），写要改的具体内容。',
+        '- `emit_action` — **非派单的流程控制**。action 枚举：',
+        '  - `approve_and_continue` — 主 AI 产出通过 review，推进 plan。可选 mark_step_complete=步骤号。',
+        '  - `record_alert` — 记录告警。必填 fallback_choice，必填 category（C1=软告警 / C2=硬告警）+ severity（warn / alert）。',
+        '  - `escalate_to_human` — 升级人工询问。在全自治模式下系统自动 alias 成 record_alert(C2)；非全自治模式会 block 等用户回答。带 question / choices / context_files。',
+        '  - `request_amendment` — 提议修改 plan。建议带 proposal。',
+        '',
+        '## 辅助工具（任意 turn 内可调，不算收尾）',
+        '- `save_plan` — 写入 plan.md（一般在 step 计划生成时调）。',
+        '- `update_state` — 提交 L2 状态变更。',
+        '- `Read` / `Glob` / `Grep` — 只读文件，用于 review 主 AI 产出。',
+        '- `Task` — 派只读子代理做重型 review（如读 50K+ 设计文档、跨文件 manifest 抽取）。子代理跑在独立 context，不污染你的对话历史。',
+        '',
+        '你**没有**写工具——不能调用 Edit / Write / Bash。修改代码靠 `dispatch_to_main_ai` / `retry_main_ai_with_hint` 让主 AI 做。',
+        '',
+        '# 一 turn 一收尾铁律',
+        '',
+        '每个 turn 必须调用**恰好一个**收尾工具：`dispatch_to_main_ai` / `retry_main_ai_with_hint` / `emit_action`，三选一。',
+        '',
+        '- **收尾工具调用成功 = 你的 turn 立即结束**。返回 "Turn complete" 后**停止输出**，不要再调任何工具，也不要再写任何文字。',
+        '- 派完单后**不存在"显式等待主 AI"的需要**——系统会在主 AI 回执时自动唤醒你。',
+        '- 第二个收尾工具调用会被 `[CAPTURE_GUARD]` 拒（first-wins），第一个动作仍然生效。但这表明你**违反了协议**，下次注意。',
+        '- 错误示范：调 `dispatch_to_main_ai` → 又调 `emit_action(approve_and_continue)` 表达"派完顺便确认上一步"——拆成两个 turn。',
+        '- 正确示范：调一个收尾工具 → 沉默结束本轮。',
+        '',
+        '# review 协议（强约束）',
+        '',
         '收到 turn_end / verify_result / review_result 等"主 AI 已产出"类事件时：',
         '1) **必须**至少调用一次 `Glob` 或 `Read`（针对 modified_in_plan 文件）——不可跳过；',
         '2) 怀疑有 TODO / FIXME / 桩函数 / 假数据时，调用 `Grep` 验证；',
-        '3) 完成检查后再调用 `emit_action`。',
-        '**绝不可以只在自然语言里说"我读了 XXX 文件"而不真正发出 tool_use**——',
-        '只信主 AI 自述、跳过文件检查直接 emit_action 视为协议违例，本轮判失败。',
+        '3) 完成检查后再调用收尾工具。',
+        '**绝不可以只在自然语言里说"我读了 XXX 文件"而不真正发出 tool_use**——只信主 AI 自述、跳过文件检查直接收尾视为协议违例，本轮判失败。',
         '',
-        '收到 user_input / start 等"无产出"事件时，可以直接 emit_action 不调文件工具。',
+        '收到 user_input / start 等"无产出"事件时，可以直接收尾不调文件工具。',
         '',
-        '# 输出格式（强约束）',
-        '每一轮决策必须：',
-        '1) （可选）先输出简短自然语言段：用 💭/✓/⚠️/⚡/→ 等符号描述观察。',
-        '2) 按 review 协议调用所需文件工具（review 类事件必做）。',
-        '3) **必须调用 `emit_action` 工具**结束本轮。一轮只能调用一次；调用成功后立即结束本轮。',
+        '# 反幻觉规则（强约束）',
         '',
-        '`emit_action` 字段说明：',
-        '- action: 必填，枚举 inject_prompt / retry_with_hint / approve_and_continue / escalate_to_human / request_amendment / wait',
-        '- reason: 强烈建议，1-2 句决策原因',
-        '- inject_prompt / retry_with_hint 需要 prompt（注入给主 AI 的内容）',
-        '- retry_with_hint 可选 wait_seconds（延迟秒数）',
-        '- escalate_to_human 需要 question，可选 choices / context_files',
-        '- request_amendment 建议带 proposal',
-        '- approve_and_continue 可选 mark_step_complete（步骤序号）',
-        '- wait 无额外字段',
+        '`dispatch_to_main_ai` / `retry_main_ai_with_hint` 是派单的唯一事实来源。系统以"你本轮是否真的调用过这两个工具之一"判定派单是否发生，**不看**你的自然语言陈述。',
         '',
-        '若不确定下一步，调用 `emit_action(action="wait")`——**绝不可以只输出文字不调用工具**。',
+        '- **禁止在 narration / reason 里虚构事实**。以下断言只有在本轮真的调过 dispatch/retry 工具后才合法：',
+        '  - "已派单 / 已下发 / 已发送指令给主 AI"',
+        '  - "主 AI 已 ack / ping 通过 / 已上线 / 已确认在线"',
+        '  - "主 AI 完成 X / 主 AI 回执 X"',
+        '- **派单是动作不是描述**。想让主 AI 做任何事，**先调 dispatch/retry 工具，再说**。',
         '',
         '# 行为约束',
-        '- 方案 plan.md 是标准答案。主 AI 不能擅自偏离；偏离时升级用户（escalate_to_human）或要求修正（inject_prompt）。',
-        '- 一轮只调用一次 emit_action。',
+        '- 方案 plan.md 是标准答案。主 AI 不能擅自偏离；偏离时用 `retry_main_ai_with_hint` 要求修正，或 `emit_action(record_alert, category=C2)` 升级。',
         '- 文件工具仅用于 review 检查产出，不要用来探查无关代码。'
     );
 
@@ -342,19 +362,46 @@ export async function startSupervisorSession(params) {
     // action onto the runtime; collectAssistantTurn reads it after the turn.
     // Phase 3 (2026-05-24): pass runtimeRef so the server also exposes
     // update_state — emits [STATE_UPDATE] lines that Java's L2Store consumes.
+    //
+    // 2026-05-26: first-wins capture guard. Closing tools (emit_action /
+    // dispatch_to_main_ai / retry_main_ai_with_hint) must be called exactly
+    // once per turn. Without this guard, an LLM that called
+    // dispatch_to_main_ai followed by emit_action(wait) would silently overwrite
+    // the dispatch — the wrapper would carry wait, Java would see no
+    // inject_prompt, and the main AI would never receive the prompt while the
+    // supervisor narration claimed it did. We surface a hard error on the
+    // second attempt so the LLM learns to stop at one closing tool.
+    const onCaptureGuarded = (action) => {
+        if (runtime.lastCapturedAction !== null) {
+            console.error(
+                `[CAPTURE_GUARD] duplicate closing-tool call rejected pair=${runtime.pairId} `
+                + `supervisor=${runtime.supervisorId} turnId=${runtime.currentTurnId || '?'} `
+                + `first=${runtime.lastCapturedAction.action} `
+                + `second=${(action && action.action) || '?'}`
+            );
+            return false;
+        }
+        runtime.lastCapturedAction = action;
+        return true;
+    };
     const supervisorMcpServer = buildSupervisorMcpServer(
         sdk,
         zod,
-        (action) => { runtime.lastCapturedAction = action; },
+        onCaptureGuarded,
         { pairId: runtime.pairId, supervisorId: runtime.supervisorId }
     );
 
-    // Allow emit_action + update_state + save_plan + read-only file tools +
-    // Task (subagent dispatch) by default. Protocol v2: supervisor now owns
-    // its own subagents for review/manifest-extraction, removing the legacy
-    // "let the main AI dispatch reviewers" indirection.
+    // Allow emit_action + dispatch_to_main_ai + retry_main_ai_with_hint +
+    // update_state + save_plan + read-only file tools + Task by default.
+    // Protocol v2: supervisor now owns its own subagents for review/manifest
+    // extraction. 2026-05-26: dispatch_to_main_ai replaces emit_action
+    // (inject_prompt) for new task assignment; retry_main_ai_with_hint replaces
+    // emit_action(retry_with_hint) for review feedback. emit_action stays for
+    // non-dispatch decisions (wait / approve / record_alert / request_amendment).
     const allowedToolList = [
         QUALIFIED_EMIT_ACTION,
+        QUALIFIED_DISPATCH_TO_MAIN_AI,
+        QUALIFIED_RETRY_MAIN_AI_WITH_HINT,
         QUALIFIED_UPDATE_STATE,
         QUALIFIED_SAVE_PLAN,
         ...SUPERVISOR_READ_TOOLS,
@@ -396,6 +443,12 @@ export async function startSupervisorSession(params) {
                 if (toolName === QUALIFIED_EMIT_ACTION) {
                     return { behavior: 'allow' };
                 }
+                if (toolName === QUALIFIED_DISPATCH_TO_MAIN_AI) {
+                    return { behavior: 'allow' };
+                }
+                if (toolName === QUALIFIED_RETRY_MAIN_AI_WITH_HINT) {
+                    return { behavior: 'allow' };
+                }
                 if (toolName === QUALIFIED_UPDATE_STATE) {
                     return { behavior: 'allow' };
                 }
@@ -413,7 +466,7 @@ export async function startSupervisorSession(params) {
                 }
                 return {
                     behavior: 'deny',
-                    message: `Supervisor sessions may only call ${QUALIFIED_EMIT_ACTION} / ${QUALIFIED_UPDATE_STATE} / ${QUALIFIED_SAVE_PLAN}, Task (subagent dispatch), or read-only file tools (Read/Glob/Grep).`,
+                    message: `Supervisor sessions may only call ${QUALIFIED_EMIT_ACTION} / ${QUALIFIED_DISPATCH_TO_MAIN_AI} / ${QUALIFIED_RETRY_MAIN_AI_WITH_HINT} / ${QUALIFIED_UPDATE_STATE} / ${QUALIFIED_SAVE_PLAN}, Task (subagent dispatch), or read-only file tools (Read/Glob/Grep).`,
                 };
             },
         },
@@ -440,10 +493,16 @@ export async function startSupervisorSession(params) {
  * The returned promise resolves once the supervisor turn ends or fails.
  */
 export async function postEventToSupervisor(params) {
-    const { pairId, supervisorId, event } = params || {};
+    const { pairId, supervisorId, event, role: requestedRole } = params || {};
     if (!pairId || !supervisorId) {
         throw new Error('supervisor.postEvent requires pairId and supervisorId');
     }
+    // Contract State Machine v3 (2026-05-25): Java may request role='system'
+    // for framework-injected messages (R3 DECISION_REQUEST). Default 'user'
+    // preserves all legacy callers. We accept 'system' iff the SDK exposes
+    // it — fall back to 'user' with a "[SYSTEM] " content prefix otherwise
+    // so the message still reaches supervisor, just as a marked user msg.
+    const role = (requestedRole === 'system') ? 'system' : 'user';
 
     const runtime = runtimes.get(key(pairId, supervisorId));
     if (!runtime || runtime.disposed) {
@@ -476,17 +535,46 @@ export async function postEventToSupervisor(params) {
         const turnId = `t_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         runtime.currentTurnId = turnId;
 
-        // Enqueue the summarized event as a user message in the SDK input stream.
-        // Schema must match what the Claude Agent SDK expects (see persistent-query-service.js).
-        runtime.inputStream.enqueue({
-            type: 'user',
-            session_id: '',
-            parent_tool_use_id: null,
-            message: {
-                role: 'user',
-                content: [{ type: 'text', text: summary }],
-            },
-        });
+        // Enqueue the summarized event into the SDK input stream.
+        // - role='user'   : legacy path; appears as a user turn in supervisor history
+        // - role='system' : Contract State Machine v3; framework-injected
+        //                   message (e.g. R3 DECISION_REQUEST). Some SDK
+        //                   versions reject role='system' for streamed input;
+        //                   we fall back to 'user' with a "[SYSTEM] " prefix
+        //                   so the supervisor still sees it (prompt template
+        //                   tells it to treat such markers as system msgs).
+        const enqueueText = role === 'system' ? '[SYSTEM] ' + summary : summary;
+        try {
+            runtime.inputStream.enqueue({
+                type: role === 'system' ? 'system' : 'user',
+                session_id: '',
+                parent_tool_use_id: null,
+                message: {
+                    role: role,
+                    content: [{ type: 'text', text: enqueueText }],
+                },
+            });
+        } catch (e) {
+            // SDK rejected role='system' (older claude-agent-sdk).
+            // Retry as 'user' with the [SYSTEM] marker so the message still lands.
+            if (role === 'system') {
+                console.error(
+                    `[supervisor-channel] system-role enqueue failed for ${pairId}; `
+                    + `falling back to user with marker: ${e.message}`
+                );
+                runtime.inputStream.enqueue({
+                    type: 'user',
+                    session_id: '',
+                    parent_tool_use_id: null,
+                    message: {
+                        role: 'user',
+                        content: [{ type: 'text', text: enqueueText }],
+                    },
+                });
+            } else {
+                throw e;
+            }
+        }
 
         const turn = await collectAssistantTurn(runtime);
 
@@ -990,11 +1078,15 @@ async function collectAssistantTurn(runtime) {
                 } else if (block.type === 'tool_use') {
                     // Read/Glob/Grep invocations — we surface these to the UI
                     // so users can see what the supervisor inspected, matching
-                    // the main AI's tool card rendering. The MCP emit_action
-                    // tool is filtered out — it's an internal protocol detail,
-                    // not user-facing.
+                    // the main AI's tool card rendering. The MCP closing tools
+                    // (emit_action / dispatch_to_main_ai / retry_main_ai_with_hint)
+                    // are filtered out — they're internal protocol details
+                    // rendered as the supervisor's action card, not as a
+                    // separate tool card.
                     const isMcpAction = typeof block.name === 'string'
-                        && block.name.includes(EMIT_ACTION_TOOL_NAME);
+                        && (block.name.includes(EMIT_ACTION_TOOL_NAME)
+                            || block.name.includes(DISPATCH_TO_MAIN_AI_TOOL_NAME)
+                            || block.name.includes(RETRY_MAIN_AI_WITH_HINT_TOOL_NAME));
                     if (!isMcpAction) {
                         const entry = {
                             id: block.id,

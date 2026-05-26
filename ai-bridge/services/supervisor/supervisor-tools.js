@@ -33,21 +33,36 @@ import { generateDirectiveId, DIRECTIVE_KINDS } from './protocol-v2.js';
 
 export const SUPERVISOR_MCP_NAME = 'supervisor';
 export const EMIT_ACTION_TOOL_NAME = 'emit_action';
+export const DISPATCH_TO_MAIN_AI_TOOL_NAME = 'dispatch_to_main_ai';
+export const RETRY_MAIN_AI_WITH_HINT_TOOL_NAME = 'retry_main_ai_with_hint';
 /** Phase 3 (2026-05-24): re-exported so callers can list expected tool names. */
 export { UPDATE_STATE_TOOL_NAME, SAVE_PLAN_TOOL_NAME };
 /** Fully-qualified tool name the API sees (mcp__<server>__<tool>). */
 export const QUALIFIED_EMIT_ACTION = `mcp__${SUPERVISOR_MCP_NAME}__${EMIT_ACTION_TOOL_NAME}`;
+export const QUALIFIED_DISPATCH_TO_MAIN_AI = `mcp__${SUPERVISOR_MCP_NAME}__${DISPATCH_TO_MAIN_AI_TOOL_NAME}`;
+export const QUALIFIED_RETRY_MAIN_AI_WITH_HINT = `mcp__${SUPERVISOR_MCP_NAME}__${RETRY_MAIN_AI_WITH_HINT_TOOL_NAME}`;
 export const QUALIFIED_UPDATE_STATE = `mcp__${SUPERVISOR_MCP_NAME}__${UPDATE_STATE_TOOL_NAME}`;
 export const QUALIFIED_SAVE_PLAN = `mcp__${SUPERVISOR_MCP_NAME}__${SAVE_PLAN_TOOL_NAME}`;
 
+// 2026-05-26: inject_prompt and retry_with_hint moved to dedicated tools
+// (dispatch_to_main_ai / retry_main_ai_with_hint) with schema-enforced required
+// `prompt` fields. emit_action is strictly for non-dispatch flow control.
+//
+// 2026-05-26 (later): pruned `wait` — LLM kept calling it as a second tool
+// after dispatch_to_main_ai, overwriting lastCapturedAction. No legitimate
+// LLM use — turn-end IS the wait; the server-side downgrade in
+// buildActionWrapper synthesises a wait wrapper when no closing tool was
+// called, so "do nothing" is still expressible.
+//
+// `escalate_to_human` stays: in autonomy mode normalizeAction aliases it to
+// record_alert(C2), but the UI / Java side still consume the legacy payload
+// fields (question / choices / context_files / legacyEscalate). Non-autonomy
+// deployments may also need a blocking human-in-the-loop path.
 const ACTION_TYPES = [
-    'inject_prompt',
-    'retry_with_hint',
     'approve_and_continue',
-    'escalate_to_human',  // deprecated: aliased to record_alert + category=C2
-    'record_alert',       // Protocol v2 (2026-05-24): non-blocking alert
+    'escalate_to_human',  // autonomy mode: aliased to record_alert + category=C2
+    'record_alert',       // C1 = warn / C2 = alert
     'request_amendment',
-    'wait',
 ];
 
 const DIRECTIVE_KIND_LIST = Object.values(DIRECTIVE_KINDS);
@@ -61,40 +76,13 @@ const DIRECTIVE_KIND_LIST = Object.values(DIRECTIVE_KINDS);
 function buildEmitActionSchema(z) {
     return {
         action: z.enum(ACTION_TYPES).describe(
-            'Action type. Determines which other fields are required.'
+            'Non-dispatch flow-control action. Dispatching to the main AI uses '
+            + '`dispatch_to_main_ai` / `retry_main_ai_with_hint`, NOT this tool.'
         ),
         reason: z.string().optional().describe(
             'Short rationale (1-2 sentences) explaining this decision.'
         ),
-        // Protocol v2 (2026-05-24): structured directive fields. When action is
-        // inject_prompt, prefer the structured fields (kind/objective/...) over
-        // raw `prompt`. Legacy `prompt` still works for one-off short messages.
-        kind: z.enum(DIRECTIVE_KIND_LIST).optional().describe(
-            'inject_prompt directive kind: task_assignment | review_feedback | acknowledgement | bootstrap.'
-        ),
-        objective: z.string().optional().describe(
-            'inject_prompt: one-sentence task objective. Goes in the structured payload.'
-        ),
-        context: z.object({
-            previousStep: z.string().optional(),
-            relatedFiles: z.array(z.string()).optional(),
-        }).optional().describe(
-            'inject_prompt: optional context for the task (previous step summary, related file paths).'
-        ),
-        expectedDeliverables: z.array(z.string()).optional().describe(
-            'inject_prompt: expected deliverable paths/descriptions for this task.'
-        ),
-        acceptanceCriteria: z.array(z.string()).optional().describe(
-            'inject_prompt: acceptance criteria the main AI must meet.'
-        ),
-        prompt: z.string().optional().describe(
-            'inject_prompt/retry_with_hint: free-form fallback prompt text. ' +
-            'Either provide structured fields above OR `prompt`; if both, the structured fields take precedence and `prompt` becomes a hint.'
-        ),
-        wait_seconds: z.number().optional().describe(
-            'Optional delay in seconds before injecting prompt. Only honored for retry_with_hint.'
-        ),
-        // record_alert fields (Protocol v2)
+        // record_alert fields
         severity: z.enum(['warn', 'alert']).optional().describe(
             'record_alert: severity level. warn = C1 soft alert, alert = C2 hard alert.'
         ),
@@ -102,23 +90,24 @@ function buildEmitActionSchema(z) {
             'record_alert: decision category (C1 = auto-fallback with low confidence; C2 = skip step and continue).'
         ),
         fallback_choice: z.string().optional().describe(
-            'record_alert: the fallback you decided to take instead of human intervention.'
+            'record_alert: required — describes the fallback you took instead of human intervention.'
         ),
-        // Legacy escalate_to_human fields (aliased to record_alert internally)
+        // escalate_to_human fields (autonomy mode aliases to record_alert(C2), but
+        // the UI / Java side still render these for the legacy escalate card)
         question: z.string().optional().describe(
-            'Legacy escalate_to_human: question text. In autonomy mode this auto-aliases to record_alert with category=C2.'
+            'escalate_to_human: question text shown to the human. In autonomy mode this aliases to record_alert(C2).'
         ),
         choices: z.array(z.string()).optional().describe(
-            'Legacy escalate_to_human: optional choice list.'
+            'escalate_to_human: optional choice list shown to the human.'
         ),
         context_files: z.array(z.string()).optional().describe(
-            'Legacy escalate_to_human: optional file paths attached as context.'
+            'escalate_to_human: optional file paths attached as context for the human.'
         ),
         proposal: z.string().optional().describe(
-            'Used when action is request_amendment. The proposed plan change.'
+            'request_amendment: the proposed plan change.'
         ),
         mark_step_complete: z.number().optional().describe(
-            'Used when action is approve_and_continue. Step index to mark as done.'
+            'approve_and_continue: step index to mark as done.'
         ),
         // v3 self-decision log. Can be attached to any action when supervisor
         // made A/B-level adjustments this turn. C-level must escalate, NOT be
@@ -154,69 +143,27 @@ export function normalizeAction(args) {
     const reason = typeof args.reason === 'string' ? args.reason : '';
     const payload = {};
     let error = null;
-    let directiveId = null;
 
-    // Protocol v2 (2026-05-24): escalate_to_human auto-aliases to record_alert
-    // (category=C2) in autonomy mode. The legacy fields (question/choices/...)
-    // are preserved in payload for backward-compatible UI rendering, but the
-    // emitted action is record_alert so downstream Java treats it as
-    // non-blocking.
+    // Autonomy-mode alias: escalate_to_human → record_alert(C2). Legacy fields
+    // (question / choices / context_files) preserved so the UI's escalate card
+    // still renders correctly.
     if (action === 'escalate_to_human') {
         action = 'record_alert';
         payload.legacyEscalate = true;
         if (typeof args.question === 'string' && args.question.length > 0) {
             payload.question = args.question;
-            // Use the question as fallback_choice description if none provided
             if (typeof args.fallback_choice !== 'string') {
                 payload.fallback_choice = '(legacy escalate, no fallback provided — please record next time)';
             }
         }
         if (Array.isArray(args.choices)) payload.choices = args.choices;
         if (Array.isArray(args.context_files)) payload.context_files = args.context_files;
-        // Default category=C2 for legacy escalate so it's treated as an alert.
         payload.category = 'C2';
         payload.severity = 'alert';
     }
 
     switch (action) {
-        case 'inject_prompt': {
-            // Protocol v2: prefer structured payload. Fall back to legacy prompt-only.
-            const hasStructured = (typeof args.objective === 'string' && args.objective.length > 0)
-                || Array.isArray(args.expectedDeliverables);
-            const hasInlinePrompt = typeof args.prompt === 'string' && args.prompt.length > 0;
-            if (!hasStructured && !hasInlinePrompt) {
-                error = 'inject_prompt requires either structured fields (objective + ...) or non-empty `prompt`';
-                break;
-            }
-            payload.kind = typeof args.kind === 'string' ? args.kind : 'task_assignment';
-            if (typeof args.objective === 'string') payload.objective = args.objective;
-            if (args.context && typeof args.context === 'object') payload.context = args.context;
-            if (Array.isArray(args.expectedDeliverables)) payload.expectedDeliverables = args.expectedDeliverables;
-            if (Array.isArray(args.acceptanceCriteria)) payload.acceptanceCriteria = args.acceptanceCriteria;
-            // Inline prompt becomes inlinePrompt in structured payload (or stays as `prompt` for legacy
-            // consumers — both fields are written for transitional compatibility).
-            if (hasInlinePrompt) {
-                payload.inlinePrompt = args.prompt;
-                payload.prompt = args.prompt;
-            }
-            directiveId = generateDirectiveId();
-            break;
-        }
-        case 'retry_with_hint':
-            if (typeof args.prompt !== 'string') {
-                error = 'retry_with_hint requires `prompt`';
-            } else {
-                payload.prompt = args.prompt;
-                payload.inlinePrompt = args.prompt;
-                payload.kind = 'review_feedback';
-            }
-            if (typeof args.wait_seconds === 'number') {
-                payload.wait_seconds = args.wait_seconds;
-            }
-            directiveId = generateDirectiveId();
-            break;
         case 'record_alert':
-            // category/severity may already be set by the escalate_to_human alias above.
             if (!payload.category) {
                 payload.category = typeof args.category === 'string' ? args.category : 'C1';
             }
@@ -237,7 +184,6 @@ export function normalizeAction(args) {
                 payload.mark_step_complete = args.mark_step_complete;
             }
             break;
-        case 'wait':
         default:
             break;
     }
@@ -257,24 +203,122 @@ export function normalizeAction(args) {
         }));
     }
 
-    // Protocol v2: attach directiveId on inject_prompt/retry_with_hint so
-    // downstream (ActionRouter + webview + DirectiveTracker) can correlate the
-    // upcoming main-AI ack back to this directive.
-    if (directiveId) {
-        payload.directiveId = directiveId;
-    }
-
     return {
         action: { action, reason, payload },
         error,
-        directiveId,
     };
 }
 
 /**
- * Build the in-process MCP server that exposes emit_action. The supplied
- * onCapture callback receives the {action, reason, payload} wrapper on every
- * successful call.
+ * 2026-05-26: schema for `dispatch_to_main_ai`. The `prompt` field is REQUIRED
+ * at the API level — the Anthropic API rejects tool_use inputs that fail the
+ * Zod-derived JSON Schema before the call ever reaches us. This is the
+ * structural safety net replacing the legacy emit_action(inject_prompt) path
+ * where prompt was optional and forgettable.
+ */
+function buildDispatchToMainAiSchema(z) {
+    return {
+        prompt: z.string().min(10).describe(
+            'REQUIRED. The instruction text that will be injected as the main AI\'s '
+            + 'next user message. Must be >= 10 chars. Write a direct instruction the '
+            + 'main AI can act on — for ping/echo tests, write the exact reply text '
+            + 'you want back. The main AI sees this verbatim; it does NOT see reason / objective.'
+        ),
+        reason: z.string().optional().describe(
+            'Short rationale (1-2 sentences) for UI/log only. The main AI does NOT see this.'
+        ),
+        kind: z.enum(DIRECTIVE_KIND_LIST).optional().describe(
+            'Directive kind: task_assignment | review_feedback | acknowledgement | bootstrap. '
+            + 'Defaults to task_assignment.'
+        ),
+        objective: z.string().optional().describe(
+            'One-sentence task objective for the structured payload (optional, supplements prompt).'
+        ),
+        context: z.object({
+            previousStep: z.string().optional(),
+            relatedFiles: z.array(z.string()).optional(),
+        }).optional().describe(
+            'Optional context: previous step summary, related file paths.'
+        ),
+        expectedDeliverables: z.array(z.string()).optional().describe(
+            'Expected deliverable paths/descriptions for this task.'
+        ),
+        acceptanceCriteria: z.array(z.string()).optional().describe(
+            'Acceptance criteria the main AI must meet.'
+        ),
+    };
+}
+
+/**
+ * 2026-05-26: schema for `retry_main_ai_with_hint`. Same schema-level prompt
+ * enforcement as dispatch_to_main_ai. Semantically distinct: this is for
+ * asking the main AI to retry/adjust a previous attempt (review_feedback kind),
+ * not for new task assignment.
+ */
+function buildRetryMainAiWithHintSchema(z) {
+    return {
+        prompt: z.string().min(10).describe(
+            'REQUIRED. The hint / correction text the main AI will receive verbatim. '
+            + 'Must be >= 10 chars. Write what specifically the main AI must change '
+            + 'or redo — reference file:line or section if applicable.'
+        ),
+        reason: z.string().optional().describe(
+            'Short rationale (1-2 sentences) for UI/log only. The main AI does NOT see this.'
+        ),
+        wait_seconds: z.number().optional().describe(
+            'Optional delay in seconds before injecting the hint. Honors backoff for noisy retry loops.'
+        ),
+    };
+}
+
+/**
+ * Pure builder for the dispatch_to_main_ai action wrapper. Extracted from the
+ * tool handler so unit tests can exercise the payload shape without needing a
+ * full SDK. The `generateId` parameter is injectable for deterministic tests.
+ */
+export function buildDispatchAction(args, generateId = generateDirectiveId) {
+    const payload = {
+        kind: typeof args.kind === 'string' ? args.kind : 'task_assignment',
+        inlinePrompt: args.prompt,
+        prompt: args.prompt,
+    };
+    if (typeof args.objective === 'string') payload.objective = args.objective;
+    if (args.context && typeof args.context === 'object') payload.context = args.context;
+    if (Array.isArray(args.expectedDeliverables)) payload.expectedDeliverables = args.expectedDeliverables;
+    if (Array.isArray(args.acceptanceCriteria)) payload.acceptanceCriteria = args.acceptanceCriteria;
+    payload.directiveId = generateId();
+
+    return {
+        action: 'inject_prompt',
+        reason: typeof args.reason === 'string' ? args.reason : '',
+        payload,
+    };
+}
+
+/**
+ * Pure builder for the retry_main_ai_with_hint action wrapper. See
+ * buildDispatchAction for rationale.
+ */
+export function buildRetryAction(args, generateId = generateDirectiveId) {
+    const payload = {
+        kind: 'review_feedback',
+        inlinePrompt: args.prompt,
+        prompt: args.prompt,
+    };
+    if (typeof args.wait_seconds === 'number') payload.wait_seconds = args.wait_seconds;
+    payload.directiveId = generateId();
+
+    return {
+        action: 'retry_with_hint',
+        reason: typeof args.reason === 'string' ? args.reason : '',
+        payload,
+    };
+}
+
+/**
+ * Build the in-process MCP server that exposes emit_action and
+ * dispatch_to_main_ai. The supplied onCapture callback receives the
+ * {action, reason, payload} wrapper on every successful call from either tool.
  *
  * @param {object} sdk - resolved @anthropic-ai/claude-agent-sdk module
  * @param {object} zod - resolved zod module (loaded via sdk-loader.loadZod())
@@ -296,7 +340,12 @@ export function buildSupervisorMcpServer(sdk, zod, onCapture, runtimeRef) {
 
     const emitActionTool = sdk.tool(
         EMIT_ACTION_TOOL_NAME,
-        'Emit your final ACTION decision for this turn. Call exactly once per turn; after a successful call, your turn is complete and you must not emit further text or tool calls.',
+        'Emit a NON-DISPATCH flow-control action for this turn (wait / approve_and_continue / '
+            + 'record_alert / request_amendment / escalate_to_human). '
+            + 'For dispatching tasks to the main AI, use `dispatch_to_main_ai`. '
+            + 'For asking the main AI to retry with a hint, use `retry_main_ai_with_hint`. '
+            + 'Call exactly one closing tool per turn (this OR a dispatch tool, not both); '
+            + 'after a successful call, your turn is complete.',
         buildEmitActionSchema(z),
         async (args) => {
             const result = normalizeAction(args);
@@ -309,29 +358,114 @@ export function buildSupervisorMcpServer(sdk, zod, onCapture, runtimeRef) {
                     }],
                 };
             }
-            // 2026-05-24 (Q4 trace): log inject_prompt captures so we can prove
-            // the action made it OUT of the MCP handler (vs. being dropped on
-            // SUPERVISOR_QUERY_TIMEOUT before normalizeAction). All inject_*
-            // and retry_with_hint paths get a directiveId on payload.
-            if (result.action && (result.action.action === 'inject_prompt'
-                || result.action.action === 'retry_with_hint')) {
-                const p = result.action.payload || {};
-                const promptPreview = (p.inlinePrompt || p.prompt || '').slice(0, 80).replace(/\n/g, ' ');
-                console.error(
-                    `[INJECT_TRACE] daemon emit_action captured `
-                    + `action=${result.action.action} directiveId=${p.directiveId || '(none)'} `
-                    + `kind=${p.kind || '?'} objective=${(p.objective || '').slice(0, 60)} `
-                    + `promptPreview="${promptPreview}"`
-                );
+            let captured = false;
+            try { captured = onCapture(result.action) === true; } catch { captured = false; }
+            if (!captured) {
+                return {
+                    isError: true,
+                    content: [{
+                        type: 'text',
+                        text: 'Closing-tool guard: another closing tool (dispatch_to_main_ai / '
+                            + 'retry_main_ai_with_hint / emit_action) was already called this turn. '
+                            + 'Exactly ONE closing tool per turn. Your turn is already complete — do not call another. '
+                            + 'If you intended to dispatch AND then wait, just call the dispatch tool — '
+                            + 'the system automatically waits for the main AI ack on the next turn.',
+                    }],
+                };
             }
-            try { onCapture(result.action); } catch { /* best-effort capture */ }
             return {
                 content: [{ type: 'text', text: 'ACTION recorded. Turn complete.' }],
             };
         }
     );
 
-    const tools = [emitActionTool];
+    // 2026-05-26: dispatch_to_main_ai is the schema-enforced replacement for
+    // emit_action(action='inject_prompt'). The prompt field is required by
+    // schema (z.string().min(10)), so the API blocks malformed calls before
+    // they reach the handler. Internally it normalises to the same
+    // {action: 'inject_prompt', payload: {inlinePrompt, ...}} wrapper the
+    // Java ActionRouter consumes — no IPC protocol change needed.
+    const dispatchToMainAiTool = sdk.tool(
+        DISPATCH_TO_MAIN_AI_TOOL_NAME,
+        'Dispatch a task to the main AI. This is the ONLY way to give the main AI '
+            + 'work. The `prompt` field is required and is what the main AI actually '
+            + 'reads — write it as a direct instruction. Call this exactly once per '
+            + 'turn; after a successful call your turn is complete.',
+        buildDispatchToMainAiSchema(z),
+        async (args) => {
+            const action = buildDispatchAction(args);
+            const promptPreview = args.prompt.slice(0, 80).replace(/\n/g, ' ');
+            console.error(
+                `[INJECT_TRACE] daemon dispatch_to_main_ai captured `
+                + `directiveId=${action.payload.directiveId} `
+                + `kind=${action.payload.kind} objective=${(action.payload.objective || '').slice(0, 60)} `
+                + `promptPreview="${promptPreview}"`
+            );
+            let captured = false;
+            try { captured = onCapture(action) === true; } catch { captured = false; }
+            if (!captured) {
+                return {
+                    isError: true,
+                    content: [{
+                        type: 'text',
+                        text: 'Closing-tool guard: another closing tool was already called this turn. '
+                            + 'Exactly ONE closing tool per turn. Your turn is already complete — do not call another.',
+                    }],
+                };
+            }
+            return {
+                content: [{
+                    type: 'text',
+                    text: 'Dispatched. Main AI will receive your prompt. Turn complete. '
+                        + 'Do NOT call emit_action(wait) — the system automatically waits for the main AI ack on the next turn.',
+                }],
+            };
+        }
+    );
+
+    // 2026-05-26: retry_main_ai_with_hint replaces emit_action(action='retry_with_hint')
+    // with the same schema-enforced prompt requirement. Internally normalises to
+    // {action: 'retry_with_hint', payload: {inlinePrompt, ...}} so the Java
+    // ActionRouter sees no protocol change.
+    const retryMainAiWithHintTool = sdk.tool(
+        RETRY_MAIN_AI_WITH_HINT_TOOL_NAME,
+        'Ask the main AI to retry / adjust its previous attempt with a corrective '
+            + 'hint. Use this for review feedback. The `prompt` field is required and '
+            + 'is what the main AI reads verbatim — write the specific change you want. '
+            + 'Call this exactly once per turn; after a successful call your turn is complete.',
+        buildRetryMainAiWithHintSchema(z),
+        async (args) => {
+            const action = buildRetryAction(args);
+            const promptPreview = args.prompt.slice(0, 80).replace(/\n/g, ' ');
+            console.error(
+                `[INJECT_TRACE] daemon retry_main_ai_with_hint captured `
+                + `directiveId=${action.payload.directiveId} `
+                + `wait_seconds=${action.payload.wait_seconds ?? '-'} `
+                + `promptPreview="${promptPreview}"`
+            );
+            let captured = false;
+            try { captured = onCapture(action) === true; } catch { captured = false; }
+            if (!captured) {
+                return {
+                    isError: true,
+                    content: [{
+                        type: 'text',
+                        text: 'Closing-tool guard: another closing tool was already called this turn. '
+                            + 'Exactly ONE closing tool per turn. Your turn is already complete — do not call another.',
+                    }],
+                };
+            }
+            return {
+                content: [{
+                    type: 'text',
+                    text: 'Retry hint dispatched. Main AI will receive your hint. Turn complete. '
+                        + 'Do NOT call emit_action(wait) — the system automatically waits for the main AI ack on the next turn.',
+                }],
+            };
+        }
+    );
+
+    const tools = [emitActionTool, dispatchToMainAiTool, retryMainAiWithHintTool];
     if (runtimeRef && typeof runtimeRef.pairId === 'string' && typeof runtimeRef.supervisorId === 'string') {
         tools.push(buildUpdateStateTool(sdk, zod, runtimeRef));
         // Protocol v2 (2026-05-24): save_plan lets the supervisor persist its

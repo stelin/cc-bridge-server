@@ -76,9 +76,51 @@ export function summarizeEvent(event) {
       return formatStepBlocked(p, elapsed);
     case 'replan_due':
       return formatReplanDue(p, elapsed);
+    // v3.1 (2026-05-26): anti-hallucination state-machine guard rejection.
+    // Java-side ActionRouter rejected the previous emit_action; the supervisor
+    // MUST re-emit with a valid action this turn. Without a dedicated formatter
+    // this fell through to safeJson dump and got ignored, causing the
+    // wait-narrate-then-wait-again loop the user reported.
+    case 'action_rejected':
+      return formatActionRejected(event, elapsed);
     default:
       return `## EVENT [${elapsed} | ${type}]\n${safeJson(p)}`;
   }
+}
+
+/**
+ * v3.1 (2026-05-26): make the state-machine rejection impossible to ignore.
+ * Supervisor's LLM tends to weight free-form system events lower than its own
+ * narration — so we frame this as the highest-priority directive of the turn,
+ * with explicit "do this NOW, do not narrate" guidance.
+ */
+function formatActionRejected(event, elapsed) {
+  // Reason/suggestion sit at event-top-level in Java's payload, not under
+  // event.payload (see ActionRouter.sendActionRejectionToSupervisor).
+  const reason = (event && typeof event.reason === 'string') ? event.reason
+    : (event && event.payload && typeof event.payload.reason === 'string') ? event.payload.reason
+    : '(unspecified)';
+  const suggestion = (event && typeof event.suggestion === 'string') ? event.suggestion
+    : (event && event.payload && typeof event.payload.suggestion === 'string') ? event.payload.suggestion
+    : '(no suggestion)';
+  return [
+    `## ⛔ EVENT [${elapsed} | ACTION_REJECTED — 本轮最高优先级]`,
+    '',
+    '你的上一轮 emit_action 被 Java 端 state-machine guard 拒绝了。**本轮必须重发正确 action,不准再 wait**。',
+    '',
+    `**拒绝原因**: ${reason}`,
+    '',
+    `**修正方法**: ${suggestion}`,
+    '',
+    '## 🚨 强制规则(违反会再次被拒)',
+    '',
+    '1. **本轮 emit_action 不允许是 wait 或 wait_for_contract** — 选 inject_prompt / complete_plan / escalate_to_human 之一',
+    '2. **不要 narrate "我已经派单了" 之类的话** — 你上一轮就这么 narrate 但实际选了 wait,是 narration-action 不一致的幻觉。本轮直接做,不要说"已经做过"',
+    '3. **如果你以为已经派单**: 检查事实 —— 看 Open 合同计数,看你最近一次 emit_action 的实际类型。narration 可能在骗你',
+    '4. **常见错误**: "等待主 AI 完成 X 回执" 这种话只有在 Open > 0 时才合法;你看到这条说明 Open = 0,你必须自己发 inject_prompt',
+    '',
+    '现在立即调用正确的 emit_action,**不要先输出大段思考再调**。',
+  ].join('\n');
 }
 
 // =========================== Protocol v2 formatters ===========================
@@ -192,10 +234,11 @@ function formatBudgetExceeded(p, elapsed) {
   return [
     `## EVENT [${elapsed} | budget_exceeded]`,
     `已超出预算 (${ratioStr(p.maxRatio)})。Pair 即将被 Java 端强制暂停。`,
-    '本轮可以做最后一次收尾(可选):',
-    '- 若有未完成 step,inject_prompt 让主 AI 收尾或保存现场',
+    '本轮做最后一次收尾:',
+    '- 若有未完成 step → emit_action(inject_prompt) 让主 AI 收尾或保存现场',
+    '- 若已无未完成 step → emit_action(complete_plan, {summary: "预算超出,提前结束"}) 显式收尾',
     '- 不要派新子 agent,不要 save_plan',
-    '- 调 emit_action(wait) 结束本轮即可',
+    '- v3.1 提醒: 不要 emit_action(wait) — 没 OPEN 合同时会被 state-machine guard 拒绝',
   ].join('\n');
 }
 
