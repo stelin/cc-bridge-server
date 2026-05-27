@@ -48,6 +48,7 @@ import {
   getMainAIContextUsage,
 } from './services/claude/persistent-query-service.js';
 import { injectNetworkEnvVars } from './config/api-config.js';
+import { handleControlResponse } from './permission-ipc.js';
 
 // =============================================================================
 // Network Environment Setup (must run before any HTTPS connection)
@@ -108,6 +109,16 @@ const _originalConsoleError = console.error.bind(console);
 function writeRawLine(obj) {
   _originalStdoutWrite(JSON.stringify(obj) + '\n', 'utf8');
 }
+
+// Expose raw stdout writer to modules that need to emit _ctrl envelopes
+// (permission-ipc, etc) without going through the request-tagging wrapper
+// installed below. Without this, _ctrl messages get wrapped in {id, line}
+// envelopes — RemoteBridge on the IDE side sees msg.type === undefined and
+// routes them to handleRequestOutput instead of handleCtrl, so dialog
+// requests (ask_user_question, permission, plan_approval) silently disappear.
+globalThis.__rawStdoutWrite = function (line) {
+  _originalStdoutWrite(line, 'utf8');
+};
 
 /**
  * Send a daemon lifecycle event.
@@ -511,6 +522,20 @@ async function processRequest(request) {
         `[daemon] Invalid JSON input: ${line.substring(0, 200)}\n`,
         'utf8'
       );
+      return;
+    }
+
+    // _ctrl responses from IDE (e.g. ask_user_question_response, permission_response,
+    // plan_approval_response) carry no `method` field — they identify themselves
+    // by {type:"_ctrl"} and route directly to permission-ipc's pending-request
+    // registry. Without this short-circuit, processRequest would explode on
+    // `method.indexOf('.')` and the AskUserQuestion submit silently disappears.
+    if (request.type === '_ctrl') {
+      try {
+        handleControlResponse(request);
+      } catch (e) {
+        _originalStderrWrite(`[daemon] _ctrl response handler threw: ${e.message}\n`, 'utf8');
+      }
       return;
     }
 

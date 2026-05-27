@@ -51,7 +51,9 @@ export function handleControlResponse(msg) {
   }
   pending.delete(msg.requestId);
   clearTimeout(p.timer);
-  debugLog('CTRL_RESOLVE', `Resolving ${p.action} ${msg.requestId}`);
+  debugLog('CTRL_RESOLVE', `Resolving ${p.action} ${msg.requestId}`, {
+    denied: msg.denied === true
+  });
   p.resolve(msg);
 }
 
@@ -117,16 +119,40 @@ export async function requestPermissionFromJava(toolName, input) {
 /**
  * Request answers to AskUserQuestion tool input.
  * @param {Object} input - has `questions` array
- * @returns {Promise<Array|null>}
+ * @param {Object} [ctx={}] - Per-turn context. {@code ctx.windowId} is the IDE
+ *   tab id stamped by the IDEA plugin (ClaudeRequestParamsBuilder) and
+ *   threaded through buildQueryOptions's canUseTool closure. The IDEA-side
+ *   RemotePermissionAdapter uses it to decide tab-level pair-mode
+ *   interception (deny without popup) vs. normal mode (popup). Null is
+ *   acceptable — the IDEA side falls back to a project-wide pair check.
+ * @returns {Promise<Array|null|{__denied:true,reason:string}>} - One of:
+ *   - User answers map on normal popup completion
+ *   - {@code null} on timeout / failure
+ *   - {@code {__denied:true, reason}} when the IDEA side intercepted the call
+ *     (pair mode). canUseTool translates this into SDK {@code behavior:'deny'}.
  */
-export async function requestAskUserQuestionAnswers(input) {
-  debugLog('ASK_USER_QUESTION_START', 'Requesting answers', { input });
+export async function requestAskUserQuestionAnswers(input, ctx = {}) {
+  debugLog('ASK_USER_QUESTION_START', 'Requesting answers', { input, ctx });
   try {
     const resp = await sendRequest('ask_user_question_request', {
       questions: input?.questions || [],
       cwd: process.cwd(),
       timestamp: new Date().toISOString(),
+      // Stamp the originating tab so the IDEA side can route the pair-mode
+      // intercept per-tab. Omit when not provided so legacy senders pass
+      // unchanged.
+      ...(ctx && ctx.windowId ? { windowId: ctx.windowId } : {})
     });
+
+    // Pair-mode denial from the IDEA side: surface a structured sentinel so
+    // canUseTool can return SDK `behavior:'deny'` with the supplied reason.
+    if (resp && resp.denied === true) {
+      debugLog('ASK_USER_QUESTION_DENIED', `Denied by IDEA (pair-mode)`, {
+        reason: resp.reason
+      });
+      return { __denied: true, reason: resp.reason || 'AskUserQuestion denied' };
+    }
+
     const answers = resp.answers || null;
     debugLog('ASK_USER_QUESTION_RESPONSE', `answers=${JSON.stringify(answers)}`);
     return answers;

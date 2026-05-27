@@ -102,8 +102,29 @@ export async function canUseTool(toolName, input, options = {}) {
   if (toolName === 'AskUserQuestion') {
     debugLog('ASK_USER_QUESTION', 'Handling AskUserQuestion tool', { input });
 
-    const answers = await requestAskUserQuestionAnswers(input);
+    // _windowId is threaded in from buildQueryOptions's canUseTool closure
+    // (persistent-query-service.js / message-sender.js). Forward to the
+    // stdio _ctrl layer so the IDEA-side RemotePermissionAdapter can route
+    // the pair-mode intercept at tab granularity. Null is acceptable —
+    // IDEA falls back to project-wide pair check.
+    const answers = await requestAskUserQuestionAnswers(input, {
+      windowId: options && options._windowId ? options._windowId : null
+    });
     const elapsed = Date.now() - callStartTime;
+
+    // Pair-mode denial from the IDEA side: surface as SDK deny with the
+    // supplied reason so the main AI sees a tool error and continues
+    // autonomously without looping. See RemotePermissionAdapter.
+    if (answers && typeof answers === 'object' && answers.__denied === true) {
+      debugLog('ASK_USER_QUESTION_PAIR_DENIED', 'Pair-mode denial from IDEA', {
+        reason: answers.reason,
+        elapsed: `${elapsed}ms`
+      });
+      return {
+        behavior: 'deny',
+        message: answers.reason || 'AskUserQuestion denied'
+      };
+    }
 
     if (answers !== null) {
       debugLog('ASK_USER_QUESTION_SUCCESS', 'User provided answers', { answers, elapsed: `${elapsed}ms` });

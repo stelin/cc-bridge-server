@@ -27,7 +27,7 @@ export async function handleClaudeCommand(command, args, stdinData) {
   switch (command) {
     case 'send': {
       if (stdinData && stdinData.message !== undefined) {
-        const { message, sessionId, cwd, permissionMode, model, openedFiles, agentPrompt, streaming, disableThinking, reasoningEffort, systemPromptAppend } = stdinData;
+        const { message, sessionId, cwd, permissionMode, model, openedFiles, agentPrompt, streaming, disableThinking, reasoningEffort, systemPromptAppend, windowId } = stdinData;
         console.log(`[REASONING_EFFORT] claude-channel.send received: ${JSON.stringify({ reasoningEffort: reasoningEffort ?? null, model: model ?? null })}`);
         await claudeSendMessage(
           message,
@@ -40,7 +40,8 @@ export async function handleClaudeCommand(command, args, stdinData) {
           streaming,
           disableThinking || false,
           reasoningEffort || null,
-          systemPromptAppend || null
+          systemPromptAppend || null,
+          windowId || null
         );
       } else {
         await claudeSendMessage(args[0], args[1], args[2], args[3], args[4]);
@@ -50,7 +51,7 @@ export async function handleClaudeCommand(command, args, stdinData) {
 
     case 'sendWithAttachments': {
       if (stdinData && stdinData.message !== undefined) {
-        const { message, sessionId, cwd, permissionMode, model, attachments, openedFiles, agentPrompt, streaming, reasoningEffort, systemPromptAppend } = stdinData;
+        const { message, sessionId, cwd, permissionMode, model, attachments, openedFiles, agentPrompt, streaming, reasoningEffort, systemPromptAppend, windowId } = stdinData;
         console.log(`[REASONING_EFFORT] claude-channel.sendWithAttachments received: ${JSON.stringify({ reasoningEffort: reasoningEffort ?? null, model: model ?? null })}`);
         await claudeSendMessageWithAttachments(
           message,
@@ -59,8 +60,8 @@ export async function handleClaudeCommand(command, args, stdinData) {
           permissionMode || '',
           model || '',
           attachments
-            ? { attachments, openedFiles, agentPrompt, streaming, reasoningEffort, systemPromptAppend }
-            : { openedFiles, agentPrompt, streaming, reasoningEffort, systemPromptAppend }
+            ? { attachments, openedFiles, agentPrompt, streaming, reasoningEffort, systemPromptAppend, windowId }
+            : { openedFiles, agentPrompt, streaming, reasoningEffort, systemPromptAppend, windowId }
         );
       } else {
         await claudeSendMessageWithAttachments(args[0], args[1], args[2], args[3], args[4], stdinData);

@@ -114,6 +114,13 @@ async function createRuntime(requestContext, callbacks) {
     pairId,
     activeDirectiveId: pairContext?.activeDirectiveId || null,
     currentTurnId: null,
+    // Mutable cell holding the per-turn windowId. The PreToolUse hook closes
+    // over this ref (not the value) so each AskUserQuestion uses the
+    // CURRENT turn's windowId. Set by acquireRuntime on every reuse;
+    // initialised here from the create-time request (often preconnect,
+    // which sends no windowId — applyDynamicControls patches it before the
+    // first real turn fires).
+    windowIdRef: { value: requestContext.windowId || null },
   };
 
   const options = {
@@ -134,6 +141,9 @@ async function createRuntime(requestContext, callbacks) {
 
   // Hooks: PreToolUse for permissions (always). SubagentStop is added only in
   // Pair mode — it forwards [SUBAGENT_STOP] NDJSON tagged with runtime context.
+  console.log('[WINDOWID_TRACE] createRuntime requestContext.windowId=' + JSON.stringify(requestContext.windowId)
+    + ' sessionId=' + (requestContext.requestedSessionId || '(new)')
+    + ' signature=' + requestContext.runtimeSignature);
   const hooks = {
     ...(options.hooks || {}),
     PreToolUse: [{
@@ -152,7 +162,7 @@ async function createRuntime(requestContext, callbacks) {
         // Always update local state to keep hook and runtime in sync
         runtime.currentPermissionMode = mode;
         runtime.permissionModeState.value = mode;
-      })]
+      }, runtime.windowIdRef)]
     }]
   };
   if (pairId) {
@@ -194,6 +204,23 @@ async function createRuntime(requestContext, callbacks) {
 
 async function applyDynamicControls(runtime, requestContext) {
   if (!runtime || runtime.closed) return;
+
+  // Refresh windowId on every acquire so the PreToolUse hook's closure (which
+  // captured this same ref at createRuntime time) sees the CURRENT turn's
+  // windowId. Without this, a runtime created by preconnect (no windowId)
+  // would keep firing AskUserQuestion with windowId=null even after a real
+  // claude.send carrying a windowId arrived — causing cross-tab pair-mode
+  // misrouting (Tab A's pair denying Tab B's popup).
+  if (runtime.windowIdRef) {
+    const previous = runtime.windowIdRef.value;
+    const next = requestContext.windowId || null;
+    if (previous !== next) {
+      runtime.windowIdRef.value = next;
+      console.log('[WINDOWID_TRACE] applyDynamicControls updated windowId previous='
+        + JSON.stringify(previous) + ' next=' + JSON.stringify(next)
+        + ' sessionId=' + (runtime.sessionId || '(new)'));
+    }
+  }
 
   const targetPermissionMode = normalizePermissionMode(requestContext.permissionMode);
   if (runtime.currentPermissionMode !== targetPermissionMode) {

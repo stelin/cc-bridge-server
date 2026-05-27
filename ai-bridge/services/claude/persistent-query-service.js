@@ -227,7 +227,14 @@ function buildSystemPromptAppend(params) {
   return parts.join('\n\n---\n\n');
 }
 
-function buildQueryOptions(workingDirectory, sdkModelName, permissionMode, maxThinkingTokens, streamingEnabled, systemPromptAppend, requestedSessionId, reasoningEffort) {
+function buildQueryOptions(workingDirectory, sdkModelName, permissionMode, maxThinkingTokens, streamingEnabled, systemPromptAppend, requestedSessionId, reasoningEffort, windowId) {
+  // Close over windowId so the AskUserQuestion stdio _ctrl request carries
+  // the originating IDE tab id. The IDEA-side RemotePermissionAdapter uses
+  // this to decide whether the tab is currently in supervisor pair mode
+  // (deny without popup) vs. normal mode (popup). Null falls back to
+  // project-wide pair check on the IDEA side.
+  const wrappedCanUseTool = (toolName, input, opts = {}) =>
+    canUseTool(toolName, input, { ...opts, _windowId: windowId || null });
   return {
     cwd: workingDirectory,
     permissionMode,
@@ -243,7 +250,7 @@ function buildQueryOptions(workingDirectory, sdkModelName, permissionMode, maxTh
         [workingDirectory, process.env.IDEA_PROJECT_PATH, process.env.PROJECT_PATH].filter(Boolean)
       )
     ),
-    canUseTool,
+    canUseTool: wrappedCanUseTool,
     settingSources: ['user', 'project', 'local'],
     systemPrompt: {
       type: 'preset',
@@ -318,10 +325,22 @@ async function buildRequestContext(params, withAttachments) {
     console.log(`[REASONING_EFFORT] ⊝ persistent buildRequestContext: no effort set (model=${sdkModelName ?? modelId ?? 'default'}, maxThinkingTokens=${maxThinkingTokens ?? 'undefined'}, raw=${JSON.stringify(params.reasoningEffort ?? null)})`);
   }
 
+  // Tab identity stamped by the IDEA plugin (ClaudeRequestParamsBuilder).
+  // Threaded into buildQueryOptions's canUseTool closure so AskUserQuestion
+  // can ride a stdio _ctrl envelope carrying the originating tab. Null is
+  // acceptable — IDEA-side RemotePermissionAdapter falls back to a project
+  // wide pair check.
+  const windowId = (typeof params.windowId === 'string' && params.windowId.trim() !== '')
+    ? params.windowId.trim()
+    : null;
+  console.log('[WINDOWID_TRACE] buildRequestContext params.windowId=' + JSON.stringify(params.windowId)
+    + ' resolved=' + JSON.stringify(windowId)
+    + ' sessionId=' + (requestedSessionId || '(new)'));
+
   const options = buildQueryOptions(
     workingDirectory, sdkModelName, permissionMode,
     maxThinkingTokens, streamingEnabled, systemPromptAppend, requestedSessionId,
-    normalizedReasoningEffort
+    normalizedReasoningEffort, windowId
   );
 
   const userMessage = await buildUserMessage(params, withAttachments, requestedSessionId);
@@ -376,6 +395,7 @@ async function buildRequestContext(params, withAttachments) {
     maxThinkingTokens,
     runtimeSignature,
     pairContext,
+    windowId,
   };
 }
 
