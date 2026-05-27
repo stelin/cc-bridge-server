@@ -25,15 +25,19 @@ export function createSseHub({ bufferSize = 1000, tag = '?' } = {}) {
     buffer.push({ id, data: line });
     if (buffer.length > bufferSize) buffer.shift();
 
-    let typeStr = '?';
-    try {
-      const obj = JSON.parse(line);
-      typeStr = obj.type || obj.method || obj.event || '?';
-    } catch {}
-    logger.info(`[push ${tag}] #${id} type=${typeStr} subs=${subscribers.size} bytes=${line.length}`);
+    // Hot path: each daemon emits 100+ stdout lines/s during streaming.
+    // The per-line JSON.parse + sync stderr write (logger.info → console.error)
+    // dominated the Node event loop under multi-session concurrent chat and
+    // delayed cross-session HTTP handlers. Gate the whole block on verbose so
+    // info-level deployments pay zero per-line cost.
     if (logger.isVerbose()) {
+      let typeStr = '?';
+      try {
+        const obj = JSON.parse(line);
+        typeStr = obj.type || obj.method || obj.event || '?';
+      } catch {}
       const preview = line.length > 800 ? line.slice(0, 800) + `...(${line.length}b)` : line;
-      logger.verbose(`[push ${tag}] #${id} payload=${preview}`);
+      logger.verbose(`[push ${tag}] #${id} type=${typeStr} subs=${subscribers.size} bytes=${line.length} payload=${preview}`);
     }
 
     for (const res of subscribers) writeEvent(res, id, line);

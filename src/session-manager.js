@@ -155,15 +155,18 @@ export function createSessionManager({
       const trimmed = line.trim();
       if (!trimmed) return;
       maybeCaptureClaudeSid(s, trimmed);
-      // Surface [REASONING_EFFORT] markers into server log.
-      // daemon wraps its stdout into {"id":"...","line":"..."} — scan both raw + wrapped.
-      if (trimmed.includes('[REASONING_EFFORT]')) {
+      // REASONING_EFFORT diagnostic logging gated behind verbose. The
+      // includes() probe runs on every stdout line; the JSON.parse + sync
+      // stderr write only fires when verbose, so multi-session streaming
+      // doesn't pay the cost at info level. Hub.publish below is unchanged
+      // — the wire data to subscribers is byte-identical.
+      if (logger.isVerbose() && trimmed.includes('[REASONING_EFFORT]')) {
         try {
           const parsed = JSON.parse(trimmed);
           const inner = typeof parsed?.line === 'string' ? parsed.line : trimmed;
-          logger.info(`[daemon ${s.sid.slice(0, 8)}] ${inner}`);
+          logger.verbose(`[daemon ${s.sid.slice(0, 8)}] ${inner}`);
         } catch {
-          logger.info(`[daemon ${s.sid.slice(0, 8)}] ${trimmed}`);
+          logger.verbose(`[daemon ${s.sid.slice(0, 8)}] ${trimmed}`);
         }
       }
       s.hub.publish(trimmed);
