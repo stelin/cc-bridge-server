@@ -25,6 +25,7 @@
 
 import { loadClaudeSdk, loadZod, isClaudeSdkAvailable } from '../utils/sdk-loader.js';
 import { AsyncStream } from '../utils/async-stream.js';
+import { estimateTokensFromChars } from '../utils/usage-utils.js';
 import { summarizeEvent } from '../services/supervisor/event-summarizer.js';
 import {
     buildSupervisorMcpServer,
@@ -418,6 +419,12 @@ export async function startSupervisorSession(params) {
             cwd,
             model: runtime.model,
             maxTurns: 100,
+            // 2026-05-28: emit partial-message stream_event frames so the
+            // supervisor's WaitingIndicator can show a live "↓ N tokens" counter
+            // during the turn. collectAssistantTurn consumes these for the live
+            // estimate ONLY — rendering stays driven by complete assistant
+            // messages, so no double-render. See the stream_event branch.
+            includePartialMessages: true,
             // The SDK accepts a string-or-object systemPrompt. Use a string here so the
             // claude_code preset is NOT activated — Supervisor must obey OUR persona,
             // not Claude Code's default agent instructions.
@@ -997,6 +1004,12 @@ async function collectAssistantTurn(runtime) {
     let lastFrameMs = turnStartMs;
     let prevFrameKind = 'init'; // init | tool_use | compact | text | result | other
     let lastToolUseName = null;
+    // Live output-token estimate (2026-05-28): streamed chars (text + thinking)
+    // + last-emit timestamp for throttling + authoritative running output from
+    // message_delta. Drives the supervisor pane's live "↓ N tokens".
+    let streamedOutputChars = 0;
+    let lastLiveUsageEmitMs = 0;
+    let liveRealOutputTokens = 0;
     while (true) {
         if (runtime.disposed) {
             throw new Error('Supervisor runtime disposed mid-turn');
@@ -1044,6 +1057,34 @@ async function collectAssistantTurn(runtime) {
 
         const msg = next.value;
         if (!msg) continue;
+
+        // Live-usage path (2026-05-28): with includePartialMessages on, the SDK
+        // yields stream_event frames. Consume them ONLY for the live output-token
+        // ticker, then skip the rest (no streamSdkMessage / no content
+        // extraction) so rendering stays driven by the complete assistant
+        // messages below — no double-render.
+        if (msg.type === 'stream_event' && msg.event) {
+            const ev = msg.event;
+            if (ev.type === 'message_delta' && ev.usage
+                    && typeof ev.usage.output_tokens === 'number') {
+                liveRealOutputTokens = ev.usage.output_tokens;
+            }
+            if (ev.type === 'content_block_delta' && ev.delta) {
+                const chunk = ev.delta.type === 'text_delta' ? (ev.delta.text || '')
+                    : ev.delta.type === 'thinking_delta' ? (ev.delta.thinking || '')
+                    : '';
+                if (chunk) {
+                    streamedOutputChars += chunk.length;
+                    const now = Date.now();
+                    if (now - lastLiveUsageEmitMs >= 150) {
+                        lastLiveUsageEmitMs = now;
+                        const est = estimateTokensFromChars(streamedOutputChars);
+                        emitSupervisorLiveUsage(runtime, Math.max(liveRealOutputTokens, est));
+                    }
+                }
+            }
+            continue;
+        }
 
         // Record this message's shape so we can debug usage extraction later.
         // Cheap (constant string concat); the dump happens once per turn.
@@ -1199,6 +1240,28 @@ async function collectAssistantTurn(runtime) {
         compactEvents,
         usage: lastUsage ? normaliseUsage(lastUsage) : null,
     };
+}
+
+/**
+ * 2026-05-28: emit a live output-token estimate for the supervisor turn, tagged
+ * like {@link streamSdkMessage} so Java can route it by pairId/supervisorId. The
+ * count is the larger of the authoritative message_delta output and the streamed
+ * char estimate (never moves backward). Best-effort — a dropped line just skips
+ * one tick, never breaks the turn.
+ */
+function emitSupervisorLiveUsage(runtime, outputTokens) {
+    try {
+        const envelope = {
+            pairId: runtime.pairId,
+            supervisorId: runtime.supervisorId,
+            turnId: runtime.currentTurnId,
+            outputTokens,
+        };
+        process.stdout.write('[SUPERVISOR_USAGE] ' + JSON.stringify(envelope) + '\n');
+    } catch (e) {
+        console.error('[supervisor-stream] failed to emit live usage: '
+            + (e?.message || String(e)));
+    }
 }
 
 /**

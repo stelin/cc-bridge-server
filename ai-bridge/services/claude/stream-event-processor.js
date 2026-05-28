@@ -1,4 +1,4 @@
-import { emitAccumulatedUsage, mergeUsage } from '../../utils/usage-utils.js';
+import { emitAccumulatedUsage, mergeUsage, estimateTokensFromChars, emitLiveUsage } from '../../utils/usage-utils.js';
 import { truncateErrorContent, truncateToolResultBlock } from './message-output-filter.js';
 
 export function emitUsageTag(msg) {
@@ -27,7 +27,12 @@ export function createTurnState(requestContext, runtime) {
     lastAssistantContent: '',
     lastThinkingContent: '',
     finalSessionId: requestContext.requestedSessionId || runtime?.sessionId || '',
-    accumulatedUsage: null
+    accumulatedUsage: null,
+    // Live output-token estimate (2026-05-28): chars streamed this turn +
+    // last emit timestamp for throttling. Drives the CLI-style ticking counter
+    // since message_delta usage alone is too sparse (see emitLiveUsage).
+    streamedOutputChars: 0,
+    lastUsageEmitMs: 0
   };
 }
 
@@ -45,12 +50,26 @@ export function processStreamEvent(msg, turnState) {
   }
 
   if (event.type === 'content_block_delta' && event.delta) {
+    let chunk = '';
     if (event.delta.type === 'text_delta' && event.delta.text) {
       process.stdout.write(`[CONTENT_DELTA] ${JSON.stringify(event.delta.text)}\n`);
       turnState.lastAssistantContent += event.delta.text;
+      chunk = event.delta.text;
     } else if (event.delta.type === 'thinking_delta' && event.delta.thinking) {
       process.stdout.write(`[THINKING_DELTA] ${JSON.stringify(event.delta.thinking)}\n`);
       turnState.lastThinkingContent += event.delta.thinking;
+      chunk = event.delta.thinking;
+    }
+    // Live token estimate: both text and thinking count toward output_tokens.
+    // Emit a throttled [USAGE] so the "↓ N tokens" counter ticks during the
+    // turn (incl. the thinking phase) instead of jumping once at message_delta.
+    if (chunk) {
+      turnState.streamedOutputChars += chunk.length;
+      const now = Date.now();
+      if (now - turnState.lastUsageEmitMs >= 150) {
+        turnState.lastUsageEmitMs = now;
+        emitLiveUsage(turnState.accumulatedUsage, estimateTokensFromChars(turnState.streamedOutputChars));
+      }
     }
   }
 }
