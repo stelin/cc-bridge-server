@@ -567,6 +567,25 @@ async function processRequest(request) {
       return;
     }
 
+    // Supervisor interrupt must ALSO bypass the command queue. Its whole job is
+    // to settle a supervisor turn that is *currently holding* the queue (the
+    // postEvent's `await collectAssistantTurn` is what's blocking). If we let it
+    // queue normally it would wait behind the very turn it is meant to stop, so
+    // the manual Stop button would never fire until the turn ended on its own.
+    // interruptSupervisor() calls runtime.query.interrupt(), which settles the
+    // in-flight query.next() and lets the postEvent complete (its own done line
+    // then unblocks the Java EventBus). Fire-and-forget, like abort.
+    if (request.method === 'supervisor.interrupt') {
+      interruptSupervisor(request.params || {}).catch((e) => {
+        _originalStderrWrite(
+          `[daemon] supervisor.interrupt error: ${e.message}\n`,
+          'utf8'
+        );
+      });
+      writeRawLine({ id: request.id || '0', done: true, success: true });
+      return;
+    }
+
     // Command requests are serialized to prevent activeRequestId conflicts
     commandQueue = commandQueue
       .then(() => processRequest(request))
