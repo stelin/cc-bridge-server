@@ -34,12 +34,28 @@ import { setActiveQueryResult } from './message-session-registry.js';
 
 const SUPPORTED_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 
+// 'ultra' is Claude Code's "ultracode" session setting, NOT an SDK effort
+// level: it sends xhigh to the model AND enables dynamic workflow orchestration.
+// Only meaningful on an xhigh-capable model (Opus 4.8).
+// https://code.claude.com/docs/en/model-config#adjust-effort-level
+const ULTRACODE_SETTINGS = { ultracode: true, enableWorkflows: true };
+
 function normalizeReasoningEffort(value) {
   const e = typeof value === 'string' ? value.trim() : '';
   if (!e) return null;
   if (SUPPORTED_EFFORT_LEVELS.has(e)) return e;
   console.warn(`[REASONING_EFFORT] ⚠️ unsupported effort value received: ${JSON.stringify(value)} — falling back to SDK default`);
   return null;
+}
+
+// Translate the UI reasoning tier into the SDK shape. 'ultra' → xhigh effort +
+// ultracode/workflow settings; everything else passes through normalizeReasoningEffort.
+function resolveEffortAndSettings(rawEffort) {
+  const e = typeof rawEffort === 'string' ? rawEffort.trim() : '';
+  if (e === 'ultra') {
+    return { effort: 'xhigh', settings: ULTRACODE_SETTINGS };
+  }
+  return { effort: normalizeReasoningEffort(rawEffort), settings: null };
 }
 
 /**
@@ -447,19 +463,24 @@ export async function sendMessage(message, resumeSessionId = null, cwd = null, p
     const systemPromptAppend = buildSystemPromptAppend(openedFiles, agentPrompt, message, rotationAppend);
 
     const effectivePermissionMode = (!permissionMode || permissionMode === '') ? 'default' : permissionMode;
-    const normalizedReasoningEffort = normalizeReasoningEffort(reasoningEffort);
+    const { effort: normalizedReasoningEffort, settings: ultracodeSettings } = resolveEffortAndSettings(reasoningEffort);
     const { alwaysThinkingEnabled, maxThinkingTokens: resolvedMaxThinkingTokens } = resolveThinkingConfig(settings);
     // effort 与 maxThinkingTokens 互斥
     const maxThinkingTokens = normalizedReasoningEffort ? undefined : resolvedMaxThinkingTokens;
     streamingEnabled = streaming != null ? streaming : (settings?.streamingEnabled ?? false);
-    console.log('[DEBUG] Config:', { effectivePermissionMode, alwaysThinkingEnabled, maxThinkingTokens, streamingEnabled, reasoningEffort: normalizedReasoningEffort, disableThinking });
+    console.log('[DEBUG] Config:', { effectivePermissionMode, alwaysThinkingEnabled, maxThinkingTokens, streamingEnabled, reasoningEffort: normalizedReasoningEffort, ultracode: !!ultracodeSettings, disableThinking });
 
     const preToolUseHook = createPreToolUseHook(effectivePermissionMode, workingDirectory, null, windowId);
     const options = buildQueryOptions({ workingDirectory, permissionMode: effectivePermissionMode, sdkModelName, maxThinkingTokens, streamingEnabled, systemPromptAppend, preToolUseHook, sdkStderrLines, windowId });
 
     if (normalizedReasoningEffort) {
       options.effort = normalizedReasoningEffort;
-      console.log(`[REASONING_EFFORT] ✓ sendMessage applied options.effort=${normalizedReasoningEffort} (model=${sdkModelName ?? model ?? 'default'}, maxThinkingTokens disabled due to mutex)`);
+      if (ultracodeSettings) {
+        options.settings = ultracodeSettings;
+        console.log(`[REASONING_EFFORT] ✓ sendMessage applied ULTRACODE (effort=${normalizedReasoningEffort} + settings=${JSON.stringify(ultracodeSettings)}, model=${sdkModelName ?? model ?? 'default'})`);
+      } else {
+        console.log(`[REASONING_EFFORT] ✓ sendMessage applied options.effort=${normalizedReasoningEffort} (model=${sdkModelName ?? model ?? 'default'}, maxThinkingTokens disabled due to mutex)`);
+      }
     } else {
       console.log(`[REASONING_EFFORT] ⊝ sendMessage: no effort set (model=${sdkModelName ?? model ?? 'default'}, maxThinkingTokens=${maxThinkingTokens ?? 'undefined'})`);
     }
@@ -526,18 +547,23 @@ export async function sendMessageWithAttachments(message, resumeSessionId = null
     const normalizedPermissionMode = (!permissionMode || permissionMode === '') ? 'default' : permissionMode;
     const preToolUseHook = createPreToolUseHook(normalizedPermissionMode, workingDirectory, null, stdinData?.windowId || null);
 
-    const normalizedReasoningEffort = normalizeReasoningEffort(stdinData?.reasoningEffort || null);
+    const { effort: normalizedReasoningEffort, settings: ultracodeSettings } = resolveEffortAndSettings(stdinData?.reasoningEffort || null);
     const { alwaysThinkingEnabled, maxThinkingTokens: resolvedMaxThinkingTokens } = resolveThinkingConfig(settings);
     const maxThinkingTokens = normalizedReasoningEffort ? undefined : resolvedMaxThinkingTokens;
     const streamingParam = stdinData?.streaming;
     streamingEnabled = streamingParam != null ? streamingParam : (settings?.streamingEnabled ?? false);
-    console.log('[DEBUG] (withAttachments) Config:', { normalizedPermissionMode, alwaysThinkingEnabled, maxThinkingTokens, streamingEnabled, reasoningEffort: normalizedReasoningEffort });
+    console.log('[DEBUG] (withAttachments) Config:', { normalizedPermissionMode, alwaysThinkingEnabled, maxThinkingTokens, streamingEnabled, reasoningEffort: normalizedReasoningEffort, ultracode: !!ultracodeSettings });
 
     const options = buildQueryOptions({ workingDirectory, permissionMode: normalizedPermissionMode, sdkModelName, maxThinkingTokens, streamingEnabled, systemPromptAppend, preToolUseHook, sdkStderrLines, windowId: stdinData?.windowId || null });
 
     if (normalizedReasoningEffort) {
       options.effort = normalizedReasoningEffort;
-      console.log(`[REASONING_EFFORT] ✓ sendMessageWithAttachments applied options.effort=${normalizedReasoningEffort} (model=${sdkModelName ?? model ?? 'default'}, maxThinkingTokens disabled due to mutex)`);
+      if (ultracodeSettings) {
+        options.settings = ultracodeSettings;
+        console.log(`[REASONING_EFFORT] ✓ sendMessageWithAttachments applied ULTRACODE (effort=${normalizedReasoningEffort} + settings=${JSON.stringify(ultracodeSettings)}, model=${sdkModelName ?? model ?? 'default'})`);
+      } else {
+        console.log(`[REASONING_EFFORT] ✓ sendMessageWithAttachments applied options.effort=${normalizedReasoningEffort} (model=${sdkModelName ?? model ?? 'default'}, maxThinkingTokens disabled due to mutex)`);
+      }
     } else {
       console.log(`[REASONING_EFFORT] ⊝ sendMessageWithAttachments: no effort set (model=${sdkModelName ?? model ?? 'default'}, maxThinkingTokens=${maxThinkingTokens ?? 'undefined'})`);
     }

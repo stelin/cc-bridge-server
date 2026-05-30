@@ -38,6 +38,30 @@ export function persistJsonlMessage(sessionId, cwd, obj) {
 }
 
 /**
+ * Remove thinking / redacted_thinking blocks from a reconstructed assistant
+ * content array.
+ *
+ * Extended-thinking blocks carry a cryptographic `signature` that is only valid
+ * for the exact request that produced them. When we manually rebuild a resumed
+ * conversation and replay a prior turn's thinking blocks into a fresh messages
+ * array, the API rejects them with:
+ *   400 messages.N.content.M: thinking or redacted_thinking blocks in the
+ *   latest assistant message cannot be modified.
+ * The Messages API only requires thinking blocks to be preserved unmodified
+ * within the SAME turn's tool-use loop (handled by the Agent SDK), never across
+ * turns — so dropping historical thinking blocks here is both safe and required
+ * for this non-thinking fallback request.
+ */
+function stripThinkingBlocks(content) {
+  if (!Array.isArray(content)) {
+    return content;
+  }
+  return content.filter(
+    (block) => !block || (block.type !== 'thinking' && block.type !== 'redacted_thinking')
+  );
+}
+
+/**
  * Load session history messages (used to maintain context when resuming a session).
  * Returns an array of messages in the Anthropic Messages API format.
  */
@@ -64,9 +88,15 @@ export function loadSessionHistory(sessionId, cwd) {
             content: msg.message.content
           });
         } else if (msg.type === 'assistant' && msg.message && msg.message.content) {
+          const cleanedContent = stripThinkingBlocks(msg.message.content);
+          // Skip turns that became empty after stripping (thinking-only turns);
+          // an empty assistant content array is itself an API error.
+          if (Array.isArray(cleanedContent) && cleanedContent.length === 0) {
+            continue;
+          }
           messages.push({
             role: 'assistant',
-            content: msg.message.content
+            content: cleanedContent
           });
         }
       } catch (e) {

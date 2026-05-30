@@ -30,6 +30,11 @@ export function buildRuntimeSignature(options, systemPromptAppend, streamingEnab
     runtimeSessionEpoch: runtimeSessionEpoch || '',
     model: options.model || '',
     pairId: pairId || '',
+    // Toggling 'ultra' (ultracode) flips workflow orchestration, which the SDK
+    // only reads at query creation. Including it here forces a clean recreation
+    // when the user switches into/out of Ultra. Plain effort levels are NOT in
+    // the signature (unchanged behaviour) — they apply on the next recreation.
+    ultracode: !!(options.settings && options.settings.ultracode),
   };
   return JSON.stringify(material);
 }

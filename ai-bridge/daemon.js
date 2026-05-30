@@ -572,9 +572,10 @@ async function processRequest(request) {
     // postEvent's `await collectAssistantTurn` is what's blocking). If we let it
     // queue normally it would wait behind the very turn it is meant to stop, so
     // the manual Stop button would never fire until the turn ended on its own.
-    // interruptSupervisor() calls runtime.query.interrupt(), which settles the
-    // in-flight query.next() and lets the postEvent complete (its own done line
-    // then unblocks the Java EventBus). Fire-and-forget, like abort.
+    // interruptSupervisor() first tries query.interrupt(), then hard-stops via
+    // query.close() if the wedged turn doesn't settle — either way the in-flight
+    // query.next() rejects, the postEvent completes, and its done line unblocks
+    // the Java EventBus (clearing the thinking spinner). Fire-and-forget, like abort.
     if (request.method === 'supervisor.interrupt') {
       interruptSupervisor(request.params || {}).catch((e) => {
         _originalStderrWrite(

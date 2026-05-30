@@ -895,22 +895,39 @@ export async function interruptSupervisor(params) {
     if (!pairId || !supervisorId) {
         throw new Error('supervisor.interrupt requires pairId and supervisorId');
     }
-    const runtime = runtimes.get(key(pairId, supervisorId));
+    const k = key(pairId, supervisorId);
+    const runtime = runtimes.get(k);
     if (!runtime || runtime.disposed) {
-        const err = new Error(
-            `SUPERVISOR_NOT_FOUND supervisor session not found or disposed: ${pairId}:${supervisorId}`
-        );
-        err.code = 'SUPERVISOR_NOT_FOUND';
-        throw err;
+        // Nothing to interrupt — the turn is already over (or the runtime was
+        // disposed). That's success from the caller's POV: emit a result line
+        // so Java settles the request and clears the thinking spinner. We do
+        // NOT throw SUPERVISOR_NOT_FOUND here: interrupt is fire-and-forget and
+        // an absent runtime means "already stopped", not a recoverable error.
+        process.stdout.write('[SUPERVISOR_INTERRUPT_RESULT] ' + JSON.stringify({
+            pairId, supervisorId, ts: Date.now(),
+            interrupted: false, forceStopped: false, error: 'SUPERVISOR_NOT_FOUND',
+        }) + '\n');
+        return { ok: true };
     }
+
+    // Capture the in-flight turn's barrier BEFORE we touch anything. postEvent
+    // reassigns runtime.busy per turn and clears runtime.currentTurnId in its
+    // finally, so these two snapshots let us tell whether the turn actually
+    // ended after interrupt() — not just whether interrupt() resolved.
+    const busyAtCall = runtime.busy;
+    const turnWasActive = runtime.currentTurnId != null;
     let interrupted = false;
+    let forceStopped = false;
     let error = null;
+
+    // 1) Graceful interrupt — preserves the SDK session/context so the
+    //    supervisor can keep observing after the current turn is cut short.
     if (typeof runtime.query?.interrupt === 'function') {
         try {
             await Promise.race([
                 runtime.query.interrupt(),
                 new Promise((_, reject) => setTimeout(
-                    () => reject(new Error('INTERRUPT_TIMEOUT')), 5_000
+                    () => reject(new Error('INTERRUPT_TIMEOUT')), 3_000
                 )),
             ]);
             interrupted = true;
@@ -920,8 +937,49 @@ export async function interruptSupervisor(params) {
     } else {
         error = 'SDK does not expose Query.interrupt';
     }
+
+    // 2) Confirm the turn actually SETTLED. query.interrupt() resolving only
+    //    means the interrupt was accepted; a turn wedged in extended-thinking
+    //    can still be blocked inside `await query.next()` (collectAssistantTurn
+    //    awaits it unbounded since the 2026-05-25 cap removal). Wait on the
+    //    captured busy barrier — it resolves via postEvent's finally release()
+    //    when the turn ends or fails — for a short grace period.
+    let settled = !turnWasActive || runtime.currentTurnId == null;
+    if (!settled) {
+        settled = await Promise.race([
+            busyAtCall.then(() => true, () => true),
+            new Promise((r) => setTimeout(() => r(false), 2_500)),
+        ]);
+    }
+
+    // 3) Hard-stop fallback. interrupt() did not unwedge the turn in time, so
+    //    force the transport down exactly like the main-AI abort path does via
+    //    disposeRuntime: query.close() rejects the blocked query.next(), which
+    //    unwinds collectAssistantTurn -> postEvent rejects -> the daemon writes
+    //    the request's done line -> Java fires onPairThinking(false) and the
+    //    spinner clears. Deleting the runtime is safe: the next postEvent hits
+    //    the SUPERVISOR_NOT_FOUND lazy-restart path and recreates it.
+    if (!settled) {
+        forceStopped = true;
+        runtime.disposed = true;
+        try { runtime.inputStream.done(); } catch { /* ignore */ }
+        try {
+            if (typeof runtime.query?.close === 'function') {
+                runtime.query.close();
+            } else if (typeof runtime.query?.return === 'function') {
+                await Promise.race([
+                    runtime.query.return(),
+                    new Promise((r) => setTimeout(r, 2_000)),
+                ]);
+            }
+        } catch (e) {
+            error = error || (e?.message || String(e));
+        }
+        runtimes.delete(k);
+    }
+
     process.stdout.write('[SUPERVISOR_INTERRUPT_RESULT] ' + JSON.stringify({
-        pairId, supervisorId, ts: Date.now(), interrupted, error,
+        pairId, supervisorId, ts: Date.now(), interrupted, forceStopped, error,
     }) + '\n');
     return { ok: true };
 }
