@@ -103,6 +103,13 @@ function buildEmitActionSchema(z) {
         context_files: z.array(z.string()).optional().describe(
             'escalate_to_human: optional file paths attached as context for the human.'
         ),
+        blocking: z.boolean().optional().describe(
+            'escalate_to_human: set true when you genuinely need the human to decide before '
+            + 'work can continue — the UI then shows a blocking modal the user must answer '
+            + '(even in autonomy mode, where escalate otherwise aliases to a non-blocking '
+            + 'record_alert). An escalation carrying a `choices` list is treated as blocking '
+            + 'automatically.'
+        ),
         proposal: z.string().optional().describe(
             'request_amendment: the proposed plan change.'
         ),
@@ -158,6 +165,11 @@ export function normalizeAction(args) {
         }
         if (Array.isArray(args.choices)) payload.choices = args.choices;
         if (Array.isArray(args.context_files)) payload.context_files = args.context_files;
+        // Preserve the blocking intent through the alias so the Java ActionRouter
+        // can promote a genuine human-decision back to a modal (vs. the default
+        // non-blocking toast). A choices[] list is itself treated as blocking
+        // downstream, so explicit blocking is only needed for choice-less asks.
+        if (args.blocking === true) payload.blocking = true;
         payload.category = 'C2';
         payload.severity = 'alert';
     }
