@@ -41,6 +41,14 @@ import {
 } from '../services/supervisor/supervisor-tools.js';
 import { buildPreCompactHook } from '../services/supervisor/pre-compact-hook.js';
 import { PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from '../services/supervisor/protocol-v2.js';
+// 2026-06-01: MCP self-check for test/bug supervisors. Reused as-is from the
+// main-AI MCP status module — same ~/.claude.json source the main AI reads,
+// so the supervisor sees exactly the servers added via `claude mcp add`.
+import {
+    loadMcpServersConfig,
+    getMcpServersStatus,
+    getMcpServerTools,
+} from '../services/claude/mcp-status/index.js';
 
 const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
 
@@ -57,6 +65,104 @@ const SUPERVISOR_READ_TOOLS = ['Read', 'Glob', 'Grep'];
 // the supervisor write files; only the supervisor's subagents do, and they
 // run in their own isolated context per SDK semantics.
 const SUPERVISOR_AGENT_TOOLS = ['Task'];
+
+/**
+ * Convert a single `~/.claude.json` server config into an SDK mcpServers entry.
+ * stdio: { command, args?, env? }; remote: { type:'sse'|'http', url, headers? }.
+ */
+function toSdkMcpServerSpec(config) {
+    if (config && typeof config.url === 'string' && config.url) {
+        return {
+            type: config.type || 'sse',
+            url: config.url,
+            ...(config.headers ? { headers: config.headers } : {}),
+        };
+    }
+    return {
+        type: 'stdio',
+        command: config.command,
+        ...(Array.isArray(config.args) ? { args: config.args } : {}),
+        ...(config.env && typeof config.env === 'object' ? { env: config.env } : {}),
+    };
+}
+
+/**
+ * Load ALL `claude mcp add` servers (~/.claude.json) and prepare them for a
+ * supervisor session that opted in via `mcpAccess`:
+ *   - sdkServers: entries to merge into query().options.mcpServers
+ *   - allowedServerNames: server-name set used by canUseTool to allow mcp__<name>__*
+ *   - promptSection: a "可用 MCP" system-prompt block (name + connection status +
+ *     tool names) for the supervisor's first-run self-check.
+ * Connection status comes from the MCP handshake (no active SELECT/PING probe).
+ * Every step is guarded: any failure (or an overall 8s timeout on the
+ * status/tools probe) degrades to a best-effort result so the supervisor
+ * always starts.
+ */
+async function buildSupervisorExternalMcp(cwd) {
+    const out = { sdkServers: {}, allowedServerNames: new Set(), allowedTools: [], promptSection: '' };
+    let servers = [];
+    try {
+        servers = await loadMcpServersConfig(cwd);
+    } catch (e) {
+        process.stderr.write(`[supervisor] loadMcpServersConfig failed: ${e?.message}\n`);
+        return out;
+    }
+    if (!Array.isArray(servers) || servers.length === 0) return out;
+
+    for (const { name, config } of servers) {
+        try {
+            out.sdkServers[name] = toSdkMcpServerSpec(config);
+            out.allowedServerNames.add(name);
+            // SDK allowedTools is an availability allowlist (Read/Glob/Grep are
+            // listed there for the same reason). `mcp__<server>` is the
+            // server-wildcard form (see permission-mode.js) — allows all of a
+            // server's tools. Without this the model can't see/call them even
+            // though canUseTool would permit.
+            out.allowedTools.push(`mcp__${name}`);
+        } catch (e) {
+            process.stderr.write(`[supervisor] skip MCP ${name}: ${e?.message}\n`);
+        }
+    }
+
+    const rows = await Promise.race([
+        (async () => {
+            let statusList = [];
+            try { statusList = await getMcpServersStatus(cwd); } catch { statusList = []; }
+            const statusByName = new Map((statusList || []).map((s) => [s.name, s]));
+            const acc = [];
+            for (const { name, config } of servers) {
+                const st = statusByName.get(name);
+                const connected = st && st.status === 'connected';
+                let toolNames = [];
+                if (connected) {
+                    try {
+                        const t = await getMcpServerTools(name, config);
+                        const arr = (t && t.tools) ? t.tools : (Array.isArray(t) ? t : []);
+                        toolNames = arr.map((x) => `mcp__${name}__${(x && x.name) || x}`);
+                    } catch { /* tools/list failure is non-fatal */ }
+                }
+                acc.push(connected
+                    ? `- ${name} [connected] 工具: ${toolNames.join(', ') || '(tools/list 未返回)'}`
+                    : `- ${name} [unavailable${st && st.error ? ': ' + st.error : ''}]`);
+            }
+            return acc;
+        })(),
+        new Promise((resolve) => setTimeout(() => resolve(null), 8000)),
+    ]);
+
+    const statusRows = rows || servers.map((s) => `- ${s.name} [status unknown: 探测超时]`);
+    out.promptSection = [
+        '',
+        '# 可用 MCP（首轮自检用）',
+        '以下是已挂载到你的 MCP server 及连接状态（连通性来自 MCP 握手，非数据探活）。',
+        '**首轮必须**把本段原样列给用户看，并核对预期的 MySQL/Redis 是否在且 connected；',
+        '不一致时按 persona 规则记录并降级，不要问人、不要阻塞。',
+        '需要看数据辅助诊断/修复/核验时，调用对应 `mcp__<server>__<tool>`（用于查/核验，禁止写库）。',
+        '',
+        ...statusRows,
+    ].join('\n');
+    return out;
+}
 
 // 2026-05-25 (FUNDAMENTAL FIX): wall-clock caps on the active path were
 // CONFLATING "stuck" with "slow but progressing". A Task subagent that reads
@@ -302,6 +408,9 @@ export async function startSupervisorSession(params) {
         // by Phase 5+ for telemetry filtering.
         successorPromptAppend,
         generation,
+        // 2026-06-01: when true (seeded on bug/unit-test/api-test supervisors),
+        // attach ALL `claude mcp add` servers to this supervisor session.
+        mcpAccess,
     } = params || {};
 
     if (!pairId || !supervisorId) {
@@ -344,6 +453,19 @@ export async function startSupervisorSession(params) {
         process.stdout.write(
             `[supervisor] gen=${generation ?? '?'} successorPromptAppend bytes=${successorPromptAppend.length}\n`
         );
+    }
+
+    // 2026-06-01: opt-in MCP access. Only supervisors with mcpAccess=true get
+    // the user's `claude mcp add` servers attached + a "可用 MCP" self-check
+    // section appended to their system prompt. Other supervisors are untouched.
+    let externalMcp = { sdkServers: {}, allowedServerNames: new Set(), allowedTools: [], promptSection: '' };
+    if (mcpAccess) {
+        externalMcp = await buildSupervisorExternalMcp(
+            process.env.IDEA_PROJECT_PATH || process.env.PROJECT_PATH || process.cwd()
+        );
+        if (externalMcp.promptSection) {
+            systemPrompt = systemPrompt + '\n' + externalMcp.promptSection;
+        }
     }
 
     const [sdk, zod] = await Promise.all([loadClaudeSdk(), loadZod()]);
@@ -410,6 +532,8 @@ export async function startSupervisorSession(params) {
         ...SUPERVISOR_READ_TOOLS,
         ...SUPERVISOR_AGENT_TOOLS,
         ...runtime.allowedTools,
+        // 2026-06-01: attached `claude mcp add` servers (empty unless mcpAccess).
+        ...externalMcp.allowedTools,
     ];
 
     // SDK options. Supervisor judgment-only: no project-scoped settings, no
@@ -431,7 +555,11 @@ export async function startSupervisorSession(params) {
             // claude_code preset is NOT activated — Supervisor must obey OUR persona,
             // not Claude Code's default agent instructions.
             systemPrompt: runtime.systemPrompt,
-            mcpServers: { [SUPERVISOR_MCP_NAME]: supervisorMcpServer },
+            mcpServers: {
+                [SUPERVISOR_MCP_NAME]: supervisorMcpServer,
+                // 2026-06-01: attached `claude mcp add` servers (empty unless mcpAccess).
+                ...externalMcp.sdkServers,
+            },
             allowedTools: allowedToolList,
             // Phase 3 (2026-05-24): register PreCompact hook so the SDK
             // pings us before auto-compacting; the Java side dumps an L2
@@ -473,9 +601,18 @@ export async function startSupervisorSession(params) {
                 if (runtime.allowedTools.includes(toolName)) {
                     return { behavior: 'allow' };
                 }
+                // 2026-06-01: full access to tools of attached `claude mcp add`
+                // servers (mcp__<server>__<tool>). Decision: allow all tools
+                // (no read-only filter); persona text constrains writes.
+                if (toolName.startsWith('mcp__')) {
+                    const serverSeg = toolName.split('__')[1];
+                    if (externalMcp.allowedServerNames.has(serverSeg)) {
+                        return { behavior: 'allow' };
+                    }
+                }
                 return {
                     behavior: 'deny',
-                    message: `Supervisor sessions may only call ${QUALIFIED_EMIT_ACTION} / ${QUALIFIED_DISPATCH_TO_MAIN_AI} / ${QUALIFIED_RETRY_MAIN_AI_WITH_HINT} / ${QUALIFIED_UPDATE_STATE} / ${QUALIFIED_SAVE_PLAN}, Task (subagent dispatch), or read-only file tools (Read/Glob/Grep).`,
+                    message: `Supervisor sessions may only call ${QUALIFIED_EMIT_ACTION} / ${QUALIFIED_DISPATCH_TO_MAIN_AI} / ${QUALIFIED_RETRY_MAIN_AI_WITH_HINT} / ${QUALIFIED_UPDATE_STATE} / ${QUALIFIED_SAVE_PLAN}, Task (subagent dispatch), read-only file tools (Read/Glob/Grep), or attached MCP tools.`,
                 };
             },
         },
