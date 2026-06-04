@@ -63,6 +63,14 @@ const ACTION_TYPES = [
     'escalate_to_human',  // autonomy mode: aliased to record_alert + category=C2
     'record_alert',       // C1 = warn / C2 = alert
     'request_amendment',
+    // v3.1 (2026-05-26): typed completion + typed wait. The Java ActionRouter
+    // has handled these since the Contract State Machine v3 refactor, but this
+    // (remote) schema never exposed them — so the supervisor was forced to fake
+    // completion via `approve_and_continue + mark_step_complete=last`, which
+    // never transitions the plan to DONE (workflow nodes then stall at 0/N).
+    'complete_plan',
+    'wait_for_contract',
+    'complete_workflow_node',
 ];
 
 const DIRECTIVE_KIND_LIST = Object.values(DIRECTIVE_KINDS);
@@ -114,7 +122,24 @@ function buildEmitActionSchema(z) {
             'request_amendment: the proposed plan change.'
         ),
         mark_step_complete: z.number().optional().describe(
-            'approve_and_continue: step index to mark as done.'
+            'approve_and_continue: step index to mark as done. NOTE: for a NON-FINAL '
+            + 'step passing review. When the LAST step is done and the whole plan is '
+            + 'complete, use action=complete_plan (or complete_workflow_node) instead.'
+        ),
+        // v3.1 typed-completion fields
+        summary: z.string().optional().describe(
+            'Used when action is complete_plan / complete_workflow_node. A short wrap-up '
+            + 'of what the plan accomplished; becomes the COMPLETION_REPORT.md header.'
+        ),
+        node_status: z.enum(['done', 'blocked']).optional().describe(
+            'Required when action is complete_workflow_node.'
+        ),
+        changed_files: z.array(z.string()).optional().describe(
+            'complete_workflow_node + done: files this node created/modified.'
+        ),
+        contractId: z.string().optional().describe(
+            'Required when action is wait_for_contract. The id of the OPEN contract you are '
+            + 'waiting on (e.g. a previously-issued dispatch still in flight).'
         ),
         // v3 self-decision log. Can be attached to any action when supervisor
         // made A/B-level adjustments this turn. C-level must escalate, NOT be
@@ -194,6 +219,31 @@ export function normalizeAction(args) {
         case 'approve_and_continue':
             if (typeof args.mark_step_complete === 'number') {
                 payload.mark_step_complete = args.mark_step_complete;
+            }
+            break;
+        case 'complete_plan':
+            // summary is optional — the Java side classifies completion severity
+            // from Plan.steps[] regardless, so a missing summary is not an error.
+            if (typeof args.summary === 'string') payload.summary = args.summary;
+            break;
+        case 'complete_workflow_node':
+            // node_status is mandatory; summary is optional, and changed_files is
+            // only meaningful on a `done` completion.
+            if (args.node_status !== 'done' && args.node_status !== 'blocked') {
+                error = 'complete_workflow_node requires node_status = done|blocked';
+            } else {
+                payload.node_status = args.node_status;
+                if (typeof args.summary === 'string') payload.summary = args.summary;
+                if (args.node_status === 'done' && Array.isArray(args.changed_files)) {
+                    payload.changed_files = args.changed_files;
+                }
+            }
+            break;
+        case 'wait_for_contract':
+            if (typeof args.contractId === 'string' && args.contractId.length > 0) {
+                payload.contractId = args.contractId;
+            } else {
+                error = 'wait_for_contract requires non-empty `contractId`';
             }
             break;
         default:

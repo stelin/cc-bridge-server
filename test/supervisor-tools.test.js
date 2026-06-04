@@ -103,6 +103,42 @@ test('normalizeAction: removed action names (wait / inject_prompt / retry_with_h
     }
 });
 
+test('normalizeAction: complete_plan carries optional summary, never errors', () => {
+    const withSummary = normalizeAction({ action: 'complete_plan', summary: 'done it' });
+    assert.equal(withSummary.error, null);
+    assert.equal(withSummary.action.payload.summary, 'done it');
+    const noSummary = normalizeAction({ action: 'complete_plan' });
+    assert.equal(noSummary.error, null);
+    assert.equal(noSummary.action.payload.summary, undefined);
+});
+
+test('normalizeAction: complete_workflow_node requires node_status, carries summary/changed_files on done', () => {
+    const bad = normalizeAction({ action: 'complete_workflow_node' });
+    assert.match(bad.error, /node_status/);
+    const done = normalizeAction({
+        action: 'complete_workflow_node',
+        node_status: 'done',
+        summary: 's',
+        changed_files: ['a.go', 'b.go'],
+    });
+    assert.equal(done.error, null);
+    assert.equal(done.action.payload.node_status, 'done');
+    assert.deepEqual(done.action.payload.changed_files, ['a.go', 'b.go']);
+    const blocked = normalizeAction({ action: 'complete_workflow_node', node_status: 'blocked', changed_files: ['x'] });
+    assert.equal(blocked.error, null);
+    assert.equal(blocked.action.payload.node_status, 'blocked');
+    // changed_files is only meaningful on done → dropped on blocked
+    assert.equal(blocked.action.payload.changed_files, undefined);
+});
+
+test('normalizeAction: wait_for_contract requires non-empty contractId', () => {
+    const bad = normalizeAction({ action: 'wait_for_contract' });
+    assert.match(bad.error, /contractId/);
+    const ok = normalizeAction({ action: 'wait_for_contract', contractId: 'c-123' });
+    assert.equal(ok.error, null);
+    assert.equal(ok.action.payload.contractId, 'c-123');
+});
+
 test('normalizeAction: decisions[] ride along, category B forces review_flag=true', () => {
     const r = normalizeAction({
         action: 'approve_and_continue',
