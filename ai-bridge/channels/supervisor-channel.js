@@ -267,6 +267,17 @@ class SupervisorRuntime {
          * @type {string | null}
          */
         this.currentTurnId = null;
+        /**
+         * Session resume (2026-06-05, session-resume-plan.md): SDK-assigned
+         * session_id captured on the first message that carries one; forwarded to
+         * Java via [SUPERVISOR_SESSION] for persistence so a restart can resume
+         * this supervisor's transcript. requestedResumeId is what we asked to
+         * resume (null = fresh); a mismatch on first capture ⇒ [SUPERVISOR_RESUME_MISS].
+         * @type {string | null}
+         */
+        this.sessionId = null;
+        /** @type {string | null} */
+        this.requestedResumeId = null;
 
         // Phase 2 (2026-05-24): diagnostic counters surfaced via
         // supervisor.health. compactCount tracks SDK auto-compaction events
@@ -411,6 +422,10 @@ export async function startSupervisorSession(params) {
         // 2026-06-01: when true (seeded on bug/unit-test/api-test supervisors),
         // attach ALL `claude mcp add` servers to this supervisor session.
         mcpAccess,
+        // Session resume (2026-06-05): non-null → continue this supervisor's prior
+        // SDK transcript instead of starting fresh (SR4). Self-checked via the
+        // captured session_id (SR5); a miss emits [SUPERVISOR_RESUME_MISS].
+        resumeSessionId,
     } = params || {};
 
     if (!pairId || !supervisorId) {
@@ -482,6 +497,10 @@ export async function startSupervisorSession(params) {
         systemPrompt,
         allowedTools,
     });
+    // Session resume (2026-06-05): remember the requested resume id so the turn
+    // loop can self-check whether the SDK honoured it (SR5).
+    runtime.requestedResumeId = (typeof resumeSessionId === 'string' && resumeSessionId.trim())
+        ? resumeSessionId.trim() : null;
 
     // Build the in-process MCP server. The handler captures the validated
     // action onto the runtime; collectAssistantTurn reads it after the turn.
@@ -555,6 +574,11 @@ export async function startSupervisorSession(params) {
             // claude_code preset is NOT activated — Supervisor must obey OUR persona,
             // not Claude Code's default agent instructions.
             systemPrompt: runtime.systemPrompt,
+            // Session resume (2026-06-05): continue the prior transcript when asked.
+            // The SDK replays the session_id's history; if it ignores resume for
+            // streaming-input/custom-systemPrompt sessions, the captured session_id
+            // won't match → [SUPERVISOR_RESUME_MISS] → Java SR6 fallback.
+            ...(runtime.requestedResumeId && { resume: runtime.requestedResumeId }),
             mcpServers: {
                 [SUPERVISOR_MCP_NAME]: supervisorMcpServer,
                 // 2026-06-01: attached `claude mcp add` servers (empty unless mcpAccess).
@@ -619,7 +643,8 @@ export async function startSupervisorSession(params) {
     });
 
     runtimes.set(k, runtime);
-    process.stdout.write(`[supervisor] started: ${k} (model=${runtime.model}, protocol=${PROTOCOL_VERSION})\n`);
+    process.stdout.write(`[supervisor] started: ${k} (model=${runtime.model}, protocol=${PROTOCOL_VERSION}`
+        + `, resume=${runtime.requestedResumeId || 'none'})\n`);
     // Appendix B (plan §附录 B): advertise the protocol set so the Java client
     // can pick one it understands. No v1 fallback is wired today — daemon and
     // Java both code to v2 only — but logging it gives a clean handle for
@@ -1255,6 +1280,30 @@ async function collectAssistantTurn(runtime) {
         const msg = next.value;
         if (!msg) continue;
 
+        // Session resume (2026-06-05): capture the SDK-assigned session_id the
+        // first time any message carries one, forward it to Java for persistence
+        // ([SUPERVISOR_SESSION]), and verify a requested resume was honoured
+        // ([SUPERVISOR_RESUME_MISS] when the SDK started a different session).
+        if (msg.session_id && runtime.sessionId !== msg.session_id) {
+            const firstCapture = runtime.sessionId === null;
+            runtime.sessionId = msg.session_id;
+            if (firstCapture) {
+                process.stdout.write('[SUPERVISOR_SESSION] ' + JSON.stringify({
+                    pairId: runtime.pairId,
+                    supervisorId: runtime.supervisorId,
+                    sessionId: msg.session_id,
+                }) + '\n');
+                if (runtime.requestedResumeId && runtime.requestedResumeId !== msg.session_id) {
+                    process.stdout.write('[SUPERVISOR_RESUME_MISS] ' + JSON.stringify({
+                        pairId: runtime.pairId,
+                        supervisorId: runtime.supervisorId,
+                        requested: runtime.requestedResumeId,
+                        actual: msg.session_id,
+                    }) + '\n');
+                }
+            }
+        }
+
         // Live-usage path (2026-05-28): with includePartialMessages on, the SDK
         // yields stream_event frames. Consume them ONLY for the live output-token
         // ticker, then skip the rest (no streamSdkMessage / no content
@@ -1631,4 +1680,18 @@ function buildActionWrapper({ pairId, supervisorId, assistantText, reasoningText
  */
 export function getActiveSupervisorCount() {
     return runtimes.size;
+}
+
+/**
+ * Session resume (2026-06-05): the SDK-assigned session_id for a live supervisor
+ * runtime, or null if not started / not yet captured (filled on the first turn).
+ * Accepts ({pairId, supervisorId}) or positional args.
+ */
+export function getSupervisorSessionId(pairId, supervisorId) {
+    if (pairId && typeof pairId === 'object') {
+        supervisorId = pairId.supervisorId;
+        pairId = pairId.pairId;
+    }
+    const runtime = runtimes.get(key(pairId, supervisorId));
+    return runtime ? (runtime.sessionId || null) : null;
 }

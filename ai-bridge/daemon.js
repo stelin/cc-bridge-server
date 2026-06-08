@@ -78,7 +78,8 @@ if (!process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE) {
 // =============================================================================
 
 // NOTE: Keep in sync with package.json version when updating.
-const DAEMON_VERSION = '1.0.0-supervisor';
+// 2026-06-05: bumped for session-resume (supervisor session_id capture + resume).
+const DAEMON_VERSION = '1.1.0-session-resume';
 const SUPERVISOR_SUPPORT = true;
 
 // =============================================================================
