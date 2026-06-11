@@ -474,7 +474,7 @@ function buildEmitPlanTool(sdk, z, onCapturePlan) {
  *        via this callback (separate from onCapture — emit_plan is non-closing).
  * @returns {object} mcp server config compatible with the query() option
  */
-export function buildSupervisorMcpServer(sdk, zod, onCapture, runtimeRef, onCapturePlan) {
+export function buildSupervisorMcpServer(sdk, zod, onCapture, runtimeRef, onCapturePlan, extraTools = []) {
     if (typeof sdk?.createSdkMcpServer !== 'function' || typeof sdk?.tool !== 'function') {
         throw new Error('Claude Agent SDK does not expose createSdkMcpServer/tool — please upgrade to >= 0.2.0');
     }
@@ -620,6 +620,10 @@ export function buildSupervisorMcpServer(sdk, zod, onCapture, runtimeRef, onCapt
     // NOT the closing-tool guard, so it can precede the step-1 dispatch.
     if (typeof onCapturePlan === 'function') {
         tools.push(buildEmitPlanTool(sdk, z, onCapturePlan));
+    }
+
+    if (Array.isArray(extraTools) && extraTools.length > 0) {
+        tools.push(...extraTools);
     }
 
     return sdk.createSdkMcpServer({
