@@ -43,6 +43,11 @@ export const QUALIFIED_DISPATCH_TO_MAIN_AI = `mcp__${SUPERVISOR_MCP_NAME}__${DIS
 export const QUALIFIED_RETRY_MAIN_AI_WITH_HINT = `mcp__${SUPERVISOR_MCP_NAME}__${RETRY_MAIN_AI_WITH_HINT_TOOL_NAME}`;
 export const QUALIFIED_UPDATE_STATE = `mcp__${SUPERVISOR_MCP_NAME}__${UPDATE_STATE_TOOL_NAME}`;
 export const QUALIFIED_SAVE_PLAN = `mcp__${SUPERVISOR_MCP_NAME}__${SAVE_PLAN_TOOL_NAME}`;
+// Plan A (2026-06-10): structured plan generator. Replaces save_plan as the
+// canonical plan mechanism — feeds PlanStateMachine.onPlanCreated (structured
+// steps + acceptance criteria), while plan.md becomes a Java-side projection.
+export const EMIT_PLAN_TOOL_NAME = 'emit_plan';
+export const QUALIFIED_EMIT_PLAN = `mcp__${SUPERVISOR_MCP_NAME}__${EMIT_PLAN_TOOL_NAME}`;
 
 // 2026-05-26: inject_prompt and retry_with_hint moved to dedicated tools
 // (dispatch_to_main_ai / retry_main_ai_with_hint) with schema-enforced required
@@ -378,20 +383,98 @@ export function buildRetryAction(args, generateId = generateDirectiveId) {
 }
 
 /**
+ * Plan A (2026-06-10): emit_plan — the structured-plan generator. The supervisor
+ * calls this ONCE, on its first turn for a task ([PLANNING_REQUIRED]), to turn
+ * the task into ordered steps, each with acceptance criteria it later verifies
+ * real artifacts against. Replaces save_plan (freeform plan.md) as the canonical
+ * plan mechanism: Java seeds PlanStateMachine.onPlanCreated from the emitted
+ * [SUPERVISOR_PLAN] line, and renders plan.md as a projection. NOT a closing tool
+ * (it precedes the step-1 dispatch in the same turn), so it captures via a
+ * separate onCapturePlan callback, bypassing the closing-tool guard.
+ */
+function buildEmitPlanSchema(z) {
+    return {
+        steps: z.array(z.object({
+            title: z.string().describe('步骤标题（一句话，命令式）。'),
+            owner: z.enum(['MAIN_AI', 'SUPERVISOR']).optional().describe('默认 MAIN_AI。'),
+            acceptanceCriteria: z.array(z.string()).optional().describe(
+                '该步验收标准（可多条）。你之后据此 Read 真实产物逐条核验，不是听主 AI 自述。'
+            ),
+        })).describe('结构化步骤列表，按执行顺序。把外部任务拆解为可执行步骤，**不要发明目标**。'),
+        rationale: z.string().optional().describe('可选：拆解思路（1-3 句）。'),
+    };
+}
+
+/** Cross-field-validate emit_plan input → {plan:{steps,rationale}, error}. */
+export function normalizePlan(args) {
+    let error = null;
+    const rationale = typeof args.rationale === 'string' ? args.rationale : '';
+    const rawSteps = Array.isArray(args.steps) ? args.steps : [];
+    if (rawSteps.length === 0) {
+        return { plan: { steps: [], rationale }, error: 'emit_plan requires a non-empty `steps` array' };
+    }
+    const steps = [];
+    for (let i = 0; i < rawSteps.length; i++) {
+        const s = rawSteps[i] || {};
+        const title = typeof s.title === 'string' ? s.title.trim() : '';
+        if (!title) { error = `step #${i} is missing a non-empty \`title\``; break; }
+        const owner = s.owner === 'SUPERVISOR' ? 'SUPERVISOR' : 'MAIN_AI';
+        const acceptanceCriteria = Array.isArray(s.acceptanceCriteria)
+            ? s.acceptanceCriteria.filter((c) => typeof c === 'string' && c.trim().length > 0)
+            : [];
+        steps.push({ index: i, title, owner, acceptanceCriteria });
+    }
+    return { plan: { steps, rationale }, error };
+}
+
+function buildEmitPlanTool(sdk, z, onCapturePlan) {
+    return sdk.tool(
+        EMIT_PLAN_TOOL_NAME,
+        'Emit the structured plan for the current task. Call EXACTLY ONCE, on your '
+        + 'first turn after a [PLANNING_REQUIRED] marker, BEFORE dispatching. Break the '
+        + 'task into ordered steps, each with acceptance criteria you will later verify. '
+        + 'This is NOT a closing tool — after emit_plan you still call dispatch_to_main_ai '
+        + 'to send step 1. The plan is then LOCKED — change it via '
+        + 'emit_action(request_amendment), not by calling emit_plan again.',
+        buildEmitPlanSchema(z),
+        async (args) => {
+            const result = normalizePlan(args);
+            if (result.error) {
+                return {
+                    isError: true,
+                    content: [{ type: 'text', text: `Validation error: ${result.error}. Call emit_plan again with corrected steps.` }],
+                };
+            }
+            try { onCapturePlan(result.plan); } catch { /* best-effort capture */ }
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Plan recorded (${result.plan.steps.length} steps). Now dispatch step 1 via `
+                        + `dispatch_to_main_ai. Use emit_action(request_amendment) to change the plan later.`,
+                }],
+            };
+        }
+    );
+}
+
+/**
  * Build the in-process MCP server that exposes emit_action and
  * dispatch_to_main_ai. The supplied onCapture callback receives the
  * {action, reason, payload} wrapper on every successful call from either tool.
  *
  * @param {object} sdk - resolved @anthropic-ai/claude-agent-sdk module
  * @param {object} zod - resolved zod module (loaded via sdk-loader.loadZod())
- * @param {(action: object) => void} onCapture
+ * @param {(action: object) => boolean} onCapture
  * @param {{pairId: string, supervisorId: string}} [runtimeRef] - Phase 3:
  *        when provided, the {@code update_state} tool is also registered so
  *        the supervisor can commit L2 deltas. Without it (legacy callers /
  *        tests) only {@code emit_action} is exposed.
+ * @param {(plan: object) => void} [onCapturePlan] - Plan A: when provided, the
+ *        {@code emit_plan} tool is registered and captures the structured plan
+ *        via this callback (separate from onCapture — emit_plan is non-closing).
  * @returns {object} mcp server config compatible with the query() option
  */
-export function buildSupervisorMcpServer(sdk, zod, onCapture, runtimeRef) {
+export function buildSupervisorMcpServer(sdk, zod, onCapture, runtimeRef, onCapturePlan) {
     if (typeof sdk?.createSdkMcpServer !== 'function' || typeof sdk?.tool !== 'function') {
         throw new Error('Claude Agent SDK does not expose createSdkMcpServer/tool — please upgrade to >= 0.2.0');
     }
@@ -530,10 +613,13 @@ export function buildSupervisorMcpServer(sdk, zod, onCapture, runtimeRef) {
     const tools = [emitActionTool, dispatchToMainAiTool, retryMainAiWithHintTool];
     if (runtimeRef && typeof runtimeRef.pairId === 'string' && typeof runtimeRef.supervisorId === 'string') {
         tools.push(buildUpdateStateTool(sdk, zod, runtimeRef));
-        // Protocol v2 (2026-05-24): save_plan lets the supervisor persist its
-        // current step plan to .claude/pair/<pairId>/plan.md. Same runtime ref
-        // contract as update_state.
-        tools.push(buildSavePlanTool(sdk, zod, runtimeRef));
+    }
+    // Plan A (2026-06-10): emit_plan replaces save_plan as the canonical plan
+    // mechanism (structured steps → PlanStateMachine, plan.md = Java projection).
+    // save_plan is no longer registered. emit_plan captures via onCapturePlan,
+    // NOT the closing-tool guard, so it can precede the step-1 dispatch.
+    if (typeof onCapturePlan === 'function') {
+        tools.push(buildEmitPlanTool(sdk, z, onCapturePlan));
     }
 
     return sdk.createSdkMcpServer({

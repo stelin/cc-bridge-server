@@ -29,29 +29,13 @@ export const UPDATE_STATE_TOOL_NAME = 'update_state';
  */
 function buildUpdateStateSchema(z) {
     return {
-        anchoredFactsDelta: z.object({
-            currentStep: z.number().optional(),
-            totalSteps: z.number().optional(),
-            currentStepTitle: z.string().optional(),
-            blockedOn: z.string().nullable().optional(),
-            lastVerifyCmd: z.string().optional(),
-            lastVerifyResult: z.string().optional(),
-            lastVerifyAt: z.number().optional(),
-        }).optional().describe(
-            'Shallow-merge into the pair\'s anchoredFacts (currentStep, totalSteps, ' +
-            'lastVerifyCmd/Result, blockedOn). Update only fields that changed this turn.'
-        ),
-        planProgressDelta: z.array(z.object({
-            step: z.number(),
-            status: z.enum(['todo', 'in_progress', 'done', 'blocked', 'skipped']).optional(),
-            attempts: z.number().optional(),
-            lastError: z.string().nullable().optional(),
-            completedAt: z.number().optional(),
-            filesChanged: z.array(z.string()).optional(),
-        })).optional().describe(
-            'Upsert plan-progress entries by step number. Each entry merges into ' +
-            'the existing one (or creates it).'
-        ),
+        // Plan A (2026-06-10): anchoredFactsDelta + planProgressDelta REMOVED.
+        // Plan structure & progress are now a PROJECTION of the authoritative
+        // PlanStateMachine (rendered Java-side from emit_plan + step transitions),
+        // so the supervisor no longer writes them here — doing so would fight the
+        // projection. update_state now carries only fileState / decisions /
+        // constraints. (Java's applyUpdateStateDelta still tolerates the removed
+        // fields if an older client sends them; we simply stop inviting them.)
         fileStateDelta: z.record(z.object({
             mtime: z.number().optional(),
             lastTouchedBy: z.string().optional(),

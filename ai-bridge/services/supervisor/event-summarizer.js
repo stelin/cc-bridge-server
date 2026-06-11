@@ -23,6 +23,35 @@
  * @param {object} [event.payload]
  * @returns {string} markdown-flavored block to be sent as a user message
  */
+
+/**
+ * Plan A (2026-06-10): planning directive prepended to a task-bearing event
+ * (user_input / start) when Java flags it via payload.planningRequired (no plan
+ * yet). Tells the supervisor to produce its structured plan via emit_plan first.
+ */
+const PLANNING_DIRECTIVE_LINES = [
+  '## [PLANNING_REQUIRED]',
+  '这是本任务的首条任务事件。你的**第一步**：调用 `emit_plan` 把任务拆成有序步骤，',
+  '每步写明 owner（默认 MAIN_AI）和**验收标准**（之后据此 Read 真实产物核验，不是听主 AI 自述）。',
+  '只做结构化、不发明目标。emit_plan 之后在同一轮用 `dispatch_to_main_ai` 派发第 1 步。',
+  '计划随后锁定：要改走 `emit_action(request_amendment)`，不要再次 emit_plan。',
+  '',
+];
+
+/**
+ * Plan A resume directive prepended to the first event after a restart that
+ * restored a non-terminal plan (Java sets payload.resuming): trust DONE, skip
+ * TODO, re-verify the IN_PROGRESS step against reality.
+ */
+const RESUME_DIRECTIVE_LINES = [
+  '## [RESUME] 你在恢复一个已有进度的计划',
+  '核验规则：**已完成(DONE)步**信任、不复查；**未开始(TODO)步**不查；',
+  '**正在执行(IN_PROGRESS)步必须对账**——先 Read 现场、对照该步验收标准判断实际完成度（可能已部分完成），',
+  '再决定 dispatch_to_main_ai 续做 / emit_action(approve_and_continue, mark_step_complete) 标完成 / retry_main_ai_with_hint 重做。',
+  '可 Read `plan.md` 看完整计划与进度，不要凭记忆臆断。',
+  '',
+];
+
 export function summarizeEvent(event) {
   if (!event || typeof event !== 'object') {
     return '## EVENT [unknown]\n(empty event)';
@@ -34,6 +63,16 @@ export function summarizeEvent(event) {
     ? `T+${p.elapsedSeconds}s`
     : (p.timestamp ? new Date(p.timestamp).toISOString() : 'now');
 
+  const body = summarizeEventBody(type, p, elapsed);
+  // Plan A resume: prepend the IN_PROGRESS reconciliation directive on the first
+  // event after a restart that restored a non-terminal plan (Java sets resuming).
+  if (p && p.resuming) {
+    return RESUME_DIRECTIVE_LINES.join('\n') + '\n\n' + body;
+  }
+  return body;
+}
+
+function summarizeEventBody(type, p, elapsed) {
   switch (type) {
     case 'turn_end':
       return formatTurnEnd(p, elapsed);
@@ -225,7 +264,7 @@ function formatBudgetWarning(p, elapsed) {
     '',
     '建议:',
     '- 评估剩余 step,识别可裁剪的非关键 step',
-    '- 若可裁剪 → save_plan(source="replan") 移除非关键 step + record_alert(severity=warn)',
+    '- 若可裁剪 → emit_action(request_amendment, {proposal:"移除非关键 step …"}) + record_alert(severity=warn)（计划已锁定，改动走 amendment）',
     '- 不可裁剪 → 继续推进,准备 partial completion 报告',
   ].join('\n');
 }
@@ -237,7 +276,7 @@ function formatBudgetExceeded(p, elapsed) {
     '本轮做最后一次收尾:',
     '- 若有未完成 step → emit_action(inject_prompt) 让主 AI 收尾或保存现场',
     '- 若已无未完成 step → emit_action(complete_plan, {summary: "预算超出,提前结束"}) 显式收尾',
-    '- 不要派新子 agent,不要 save_plan',
+    '- 不要派新子 agent,不要 emit_plan(计划已存在)',
     '- v3.1 提醒: 不要 emit_action(wait) — 没 OPEN 合同时会被 state-machine guard 拒绝',
   ].join('\n');
 }
@@ -281,8 +320,8 @@ function formatStepBlocked(p, elapsed) {
 /**
  * Phase 6 (2026-05-24): T1 replan_due. Periodic (every 5 approved steps) or
  * post-alert nudge to self-evaluate the plan. Supervisor should派 planner 子
- * agent (or assess inline if cheap) and save_plan(source="replan") only when
- * it materially changes the remaining work.
+ * agent (or assess inline if cheap) and emit_action(request_amendment) only when
+ * it materially changes the remaining work (the plan is locked after emit_plan).
  */
 function formatReplanDue(p, elapsed) {
   const trigger = p.trigger || 'periodic';
@@ -297,7 +336,7 @@ function formatReplanDue(p, elapsed) {
     '',
     '请做:',
     '1. 对照已完成 step + 现状,自评剩余 plan 是否仍然合理',
-    '2. 如有调整,派 planner 子 agent 重算,然后 mcp__supervisor__save_plan(source="replan")',
+    '2. 如有调整,emit_action(request_amendment, {proposal:"…"}) 提议修改（计划已锁定，改动走 amendment，不要再 emit_plan）',
     '3. 如无调整,在 update_state decisionAppend 里记 confidence=high 直接继续',
     '不要无脑 replan — 计划稳定时跳过本次检查也算合理决策。',
   ].join('\n');
@@ -314,8 +353,40 @@ function ratioStr(r) {
  * passed back through {@link summarizeEvent} so the existing per-type
  * formatters are reused without duplication.
  */
+/**
+ * 2026-06-11 (next-step dispatch fix): rendered when Java flags
+ * payload.nextStepToDispatch — the plan is in PENDING_DECISION with an
+ * UNDISPATCHED next TODO step and nothing in flight (the supervisor just
+ * approved the previous step). The post-approve wake otherwise carries an empty
+ * batch whose text says "emit_action wait", so the supervisor never dispatches
+ * the next step. This block replaces that with an explicit "dispatch it now"
+ * directive, and frames it as a first-dispatch (not an advance) so it never
+ * waits for a turn_report nobody can produce.
+ */
+function buildNextStepDispatchLines(ns) {
+  const idx = Number.isFinite(ns.index) ? ns.index : null;
+  const total = Number.isFinite(ns.total) ? ns.total : null;
+  const title = (typeof ns.title === 'string' && ns.title) ? ns.title : null;
+  const label = idx != null
+    ? `step ${idx}${total != null ? '/' + total : ''}${title ? ` 「${title}」` : ''}`
+    : '下一步';
+  const lines = [
+    '## [DISPATCH_NEXT_STEP] 上一步已通过——请派发下一步（不要 wait）',
+    `计划尚未完成：${label} **尚未派发**，且当前没有在途的主 AI 任务。`,
+    '**本轮必须用 `dispatch_to_main_ai` 派发它**（带 objective + acceptanceCriteria），不要 emit_action(wait)。',
+    '这是"首次派单(dispatch)"而非"推进(advance)"——它从未派发过，不需要也等不到它的 turn_report 才派。',
+  ];
+  if (Array.isArray(ns.acceptanceCriteria) && ns.acceptanceCriteria.length > 0) {
+    lines.push('该步验收标准（派单时带给主 AI，之后据此 Read 真实产物核验）：');
+    for (const c of ns.acceptanceCriteria) lines.push(`  - ${c}`);
+  }
+  return lines;
+}
+
 function formatComposite(p, elapsed) {
   const events = Array.isArray(p.events) ? p.events : [];
+  const nextStep = (p.nextStepToDispatch && typeof p.nextStepToDispatch === 'object')
+    ? p.nextStepToDispatch : null;
   const dropped = Number.isFinite(p.droppedSincePrevious) ? p.droppedSincePrevious : 0;
   const tick = Number.isFinite(p.tick) ? p.tick : '?';
   const urgent = Number.isFinite(p.urgentCount) ? p.urgentCount : 0;
@@ -345,7 +416,10 @@ function formatComposite(p, elapsed) {
     if (generationBanner) {
       lines.push('## [NEW_GENERATION_BANNER]', generationBanner, '');
     }
-    if (dropped > 0) {
+    if (nextStep) {
+      // Post-approve wake with an undispatched next step: dispatch, do NOT wait.
+      lines.push(...buildNextStepDispatchLines(nextStep));
+    } else if (dropped > 0) {
       lines.push(
         `本批次没有新事件,但有 ${dropped} 个事件在等待期间被丢弃 (ring overflow)。`,
         '如果担心遗漏,可调用 Read/Grep 复查仍在推进的文件状态。',
@@ -390,12 +464,19 @@ function formatComposite(p, elapsed) {
     '- 仍需遵守 review 协议:涉及 modified_in_plan 文件必须 Read 验证后再决策',
     '- **必须**以 emit_action 工具调用结束本轮,只输出文字会触发 120s 超时'
   );
+  if (nextStep) {
+    // A next TODO step is already waiting to be dispatched (e.g. you approved the
+    // previous step). Once you finish handling the events above, dispatch it.
+    sections.push('', ...buildNextStepDispatchLines(nextStep));
+  }
   return sections.join('\n');
 }
 
 function formatUserInput(p, elapsed) {
   const text = (p.text || '').trim();
+  const head = p.planningRequired ? PLANNING_DIRECTIVE_LINES : [];
   return [
+    ...head,
     `## USER MESSAGE [${elapsed}]`,
     '',
     text,
@@ -413,7 +494,9 @@ function formatUserInput(p, elapsed) {
 }
 
 function formatStart(p, elapsed) {
+  const head = p.planningRequired ? PLANNING_DIRECTIVE_LINES : [];
   return [
+    ...head,
     `## EVENT [${elapsed} | start]`,
     `主 AI 会话已就绪。当前步骤 = ${p.currentStep ?? 1}/${p.totalSteps ?? '?'}`,
     p.currentStepTitle ? `下一步: ${p.currentStepTitle}` : '',

@@ -34,6 +34,7 @@ import {
     QUALIFIED_RETRY_MAIN_AI_WITH_HINT,
     QUALIFIED_UPDATE_STATE,
     QUALIFIED_SAVE_PLAN,
+    QUALIFIED_EMIT_PLAN,
     SUPERVISOR_MCP_NAME,
     EMIT_ACTION_TOOL_NAME,
     DISPATCH_TO_MAIN_AI_TOOL_NAME,
@@ -51,6 +52,18 @@ import {
 } from '../services/claude/mcp-status/index.js';
 
 const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
+
+// Transient API-error retry (2026-06-10): the supervisor's model API can return
+// an empty/malformed HTTP 200 (a proxy/gateway hiccup) that the SDK surfaces as
+// "API Error: ..." assistant content with no captured action/plan. The main AI
+// already retries these (message-sender AUTO_RETRY); the supervisor did not, so
+// a transient blip surfaced a raw error and stalled the turn. Mirror the main AI.
+const MAX_TURN_RETRIES = 2;
+const RETRY_BASE_DELAY_MS = 800;
+function isTransientApiError(text) {
+    if (typeof text !== 'string' || !text) return false;
+    return /API Error:|empty or malformed response|proxy or gateway intercepting/i.test(text);
+}
 
 // v3: read-only file tools granted to the supervisor so it can perform
 // in-turn review (Glob to locate produced files, Read to inspect contents,
@@ -260,6 +273,15 @@ class SupervisorRuntime {
          */
         this.lastCapturedAction = null;
         /**
+         * Plan A (2026-06-10): filled by the emit_plan tool handler when the
+         * supervisor produces its (one-time) structured plan this turn. Captured
+         * separately from lastCapturedAction (emit_plan is non-closing, bypasses
+         * the closing-tool guard). Reset each postEvent; read after the turn to
+         * emit a [SUPERVISOR_PLAN] line. Null on every non-planning turn.
+         * @type {{steps: Array, rationale: string} | null}
+         */
+        this.lastCapturedPlan = null;
+        /**
          * v4 unified pipeline: turnId assigned at the start of postEvent. Used by
          * streamSdkMessage so each `[SUPERVISOR_MSG]` line carries the same id
          * as the wrapper's terminating `[SUPERVISOR_ACTION]`. null between
@@ -349,12 +371,52 @@ function buildSystemPrompt({ name, description, planContent, specContent }) {
         '  - `request_amendment` — 提议修改 plan。建议带 proposal。',
         '',
         '## 辅助工具（任意 turn 内可调，不算收尾）',
-        '- `save_plan` — 写入 plan.md（一般在 step 计划生成时调）。',
-        '- `update_state` — 提交 L2 状态变更。',
+        '- `emit_plan` — **生成结构化计划**（首个任务首轮调；steps[{title,owner,验收标准}]）。'
+            + '非收尾工具，emit 后仍要 dispatch 第 1 步；计划锁定后改动走 emit_action(request_amendment)。系统自动渲染 plan.md。',
+        '- `update_state` — 提交 L2 状态变更（fileState / 决策留痕 / 约束）。计划进度不用你写，系统自动投影。',
         '- `Read` / `Glob` / `Grep` — 只读文件，用于 review 主 AI 产出。',
         '- `Task` — 派只读子代理做重型 review（如读 50K+ 设计文档、跨文件 manifest 抽取）。子代理跑在独立 context，不污染你的对话历史。',
         '',
         '你**没有**写工具——不能调用 Edit / Write / Bash。修改代码靠 `dispatch_to_main_ai` / `retry_main_ai_with_hint` 让主 AI 做。',
+        '',
+        '# 规划协议（新任务第一步，最优先）',
+        '',
+        '处理一个新任务时，你的**第一个动作**是调用 `emit_plan` 产出结构化计划：',
+        '- 把任务（上面的「当前任务方案」，或用户在输入框给出的任务）拆成有序步骤；',
+        '- 每步写明 owner（默认 MAIN_AI）与**验收标准** acceptanceCriteria——你之后据此 Read 真实产物逐条核验，**不是**听主 AI 自述；',
+        '- **只做结构化，不发明目标**：目标以外部任务/方案为准。',
+        '收到带 `[PLANNING_REQUIRED]` 的事件时，**必须先 emit_plan**，然后在同一轮用 `dispatch_to_main_ai` 派发第 1 步。',
+        '`emit_plan` **不是收尾工具**（不占"一 turn 一收尾"名额）：emit 之后仍要调用一个收尾工具（通常是 dispatch_to_main_ai）。',
+        '计划一旦 emit 即**锁定**：要调整走 `emit_action(request_amendment)`，**不要再次 emit_plan**。',
+        '若你已为当前任务产出过 plan（对话历史里有），**不要重复 emit_plan**，直接按计划监督。',
+        '',
+        '# 续跑核验（恢复已有进度的计划时）',
+        '',
+        '当你在恢复一个已有进度的计划（事件里带 `[RESUME]`，或 plan.md 显示已有进度）：',
+        '- **已完成(DONE)步**信任、不复查；**未开始(TODO)步**不查；',
+        '- **正在执行(IN_PROGRESS)步必须对账**——先 Read 现场、对照该步验收标准判断它实际做到哪了'
+            + '（崩溃前可能已部分完成），再决定：dispatch_to_main_ai 续做剩余 / emit_action(approve_and_continue, mark_step_complete) 标完成 / retry_main_ai_with_hint 重做。',
+        '- 计划与进度可 Read `plan.md`（系统按你的计划自动渲染），不要凭记忆臆断。',
+        '',
+        '# 推进前置条件（铁律，任何时候都成立）',
+        '',
+        '推进下一步 / `emit_action(approve_and_continue)` 标完成 / `emit_action(complete_plan)` 收尾，前提是：',
+        '**当前步已经收到主 AI 对该步的回复（该步的 turn_report / turn_end 事件），且你已 Read 真实产物核验通过。**',
+        '把每一步钉成三态，禁止凭记忆把"派过"当成"做完了"：',
+        '- 已派发(dispatched)：你调了 `dispatch_to_main_ai`，但**还没**看到该步的 turn_report；',
+        '- 已回复(replied)：你已收到该步的 turn_report / turn_end；',
+        '- 已完成(done)：已回复 + 你据验收标准 Read 真实产物核验通过。',
+        '每次准备推进前，先就**当前步**自问：它的 turn_report 到了吗？',
+        '- 当前步 = TODO / 未开始（从未派发过）→ 这是"首次派单(dispatch)"，不是"推进(advance)"：'
+            + '**直接正常派发它**（`dispatch_to_main_ai`，带 objective + acceptanceCriteria），'
+            + '**不需要、也等不到它的 turn_report 才派**。上面的 turn_report 前置校验只适用于"已派发、等待复核/标完成"的步骤。'
+            + '（系统也会在该派下一步时给你 [DISPATCH_NEXT_STEP] 提示——照它派，别 wait。）',
+        '- 到了 → 走 review 协议（Read 核验）→ `approve_and_continue` / `complete_plan`；',
+        '- **没到（派了但主 AI 没回复）→ 禁止推进下一步、禁止标完成 / 收尾**。改用 `dispatch_to_main_ai` '
+            + '**重新下发当前步**，指令里要求主 AI **先自查这一步已做了哪些、还差哪些（可能已部分完成），'
+            + '把剩余补完，再 report_turn_completion**；收到该步回复并核验通过后，才进入下一步。',
+        '绝不凭"我记得派过 / 我以为做完了"推进——唯一的推进依据是"收到了该步的回复事件"。'
+            + '这条与上面「续跑核验」同源，只是它在任何时候都成立，不限于 [RESUME]。',
         '',
         '# 一 turn 一收尾铁律',
         '',
@@ -528,11 +590,15 @@ export async function startSupervisorSession(params) {
         runtime.lastCapturedAction = action;
         return true;
     };
+    // Plan A (2026-06-10): emit_plan capture — separate from the closing-tool
+    // guard, since a planning turn is emit_plan (non-closing) + dispatch (closing).
+    const onCapturePlan = (plan) => { runtime.lastCapturedPlan = plan; };
     const supervisorMcpServer = buildSupervisorMcpServer(
         sdk,
         zod,
         onCaptureGuarded,
-        { pairId: runtime.pairId, supervisorId: runtime.supervisorId }
+        { pairId: runtime.pairId, supervisorId: runtime.supervisorId },
+        onCapturePlan
     );
 
     // Allow emit_action + dispatch_to_main_ai + retry_main_ai_with_hint +
@@ -547,7 +613,7 @@ export async function startSupervisorSession(params) {
         QUALIFIED_DISPATCH_TO_MAIN_AI,
         QUALIFIED_RETRY_MAIN_AI_WITH_HINT,
         QUALIFIED_UPDATE_STATE,
-        QUALIFIED_SAVE_PLAN,
+        QUALIFIED_EMIT_PLAN,
         ...SUPERVISOR_READ_TOOLS,
         ...SUPERVISOR_AGENT_TOOLS,
         ...runtime.allowedTools,
@@ -613,7 +679,7 @@ export async function startSupervisorSession(params) {
                 if (toolName === QUALIFIED_UPDATE_STATE) {
                     return { behavior: 'allow' };
                 }
-                if (toolName === QUALIFIED_SAVE_PLAN) {
+                if (toolName === QUALIFIED_EMIT_PLAN) {
                     return { behavior: 'allow' };
                 }
                 if (SUPERVISOR_READ_TOOLS.includes(toolName)) {
@@ -636,7 +702,7 @@ export async function startSupervisorSession(params) {
                 }
                 return {
                     behavior: 'deny',
-                    message: `Supervisor sessions may only call ${QUALIFIED_EMIT_ACTION} / ${QUALIFIED_DISPATCH_TO_MAIN_AI} / ${QUALIFIED_RETRY_MAIN_AI_WITH_HINT} / ${QUALIFIED_UPDATE_STATE} / ${QUALIFIED_SAVE_PLAN}, Task (subagent dispatch), read-only file tools (Read/Glob/Grep), or attached MCP tools.`,
+                    message: `Supervisor sessions may only call ${QUALIFIED_EMIT_ACTION} / ${QUALIFIED_DISPATCH_TO_MAIN_AI} / ${QUALIFIED_RETRY_MAIN_AI_WITH_HINT} / ${QUALIFIED_UPDATE_STATE} / ${QUALIFIED_EMIT_PLAN}, Task (subagent dispatch), read-only file tools (Read/Glob/Grep), or attached MCP tools.`,
                 };
             },
         },
@@ -699,6 +765,7 @@ export async function postEventToSupervisor(params) {
 
         // Reset per-turn capture before enqueueing the next user message.
         runtime.lastCapturedAction = null;
+        runtime.lastCapturedPlan = null;
 
         // v4 unified pipeline: assign a turnId so streamed SDK messages and the
         // closing [SUPERVISOR_ACTION] wrapper can be correlated on the webview
@@ -747,7 +814,54 @@ export async function postEventToSupervisor(params) {
             }
         }
 
-        const turn = await collectAssistantTurn(runtime);
+        let turn = await collectAssistantTurn(runtime);
+
+        // Transient API-error retry: an empty/malformed HTTP 200 from the model
+        // endpoint surfaces as "API Error: ..." assistant text with no captured
+        // action/plan. Re-prompt up to MAX_TURN_RETRIES before falling through to
+        // the downgrade — mirrors the main AI's AUTO_RETRY so a proxy/gateway blip
+        // doesn't show a raw error or stall the supervisor.
+        for (let attempt = 1;
+             attempt <= MAX_TURN_RETRIES
+                 && !runtime.lastCapturedAction && !runtime.lastCapturedPlan
+                 && isTransientApiError(turn.assistantText);
+             attempt++) {
+            console.error(
+                `[supervisor] transient API error (retry ${attempt}/${MAX_TURN_RETRIES}) `
+                + `pair=${pairId}: ${(turn.assistantText || '').slice(0, 140).replace(/\n/g, ' ')}`
+            );
+            await new Promise((r) => setTimeout(r, RETRY_BASE_DELAY_MS * attempt));
+            if (runtime.disposed) break;
+            runtime.inputStream.enqueue({
+                type: 'user',
+                session_id: '',
+                parent_tool_use_id: null,
+                message: {
+                    role: 'user',
+                    content: [{ type: 'text', text: '上一次响应为空或异常（API/网关返回空 200）。请忽略该错误，重新对上面的事件做出决策并调用相应工具收尾。' }],
+                },
+            });
+            turn = await collectAssistantTurn(runtime);
+        }
+
+        // Plan A (2026-06-10): emit_plan side channel — forward the structured plan
+        // to Java FIRST (before [SUPERVISOR_ACTION]) so PlanStateMachine.onPlanCreated
+        // runs before the same-turn dispatch is routed; the step-1 dispatch then
+        // lands on the real plan, not a synthetic one. Same turnId as the wrapper.
+        if (runtime.lastCapturedPlan) {
+            try {
+                process.stdout.write('[SUPERVISOR_PLAN] ' + JSON.stringify({
+                    pairId,
+                    supervisorId,
+                    turnId,
+                    steps: runtime.lastCapturedPlan.steps,
+                    rationale: runtime.lastCapturedPlan.rationale || '',
+                }) + '\n');
+            } catch (e) {
+                console.error('[supervisor] failed to emit [SUPERVISOR_PLAN]: '
+                    + (e?.message || String(e)));
+            }
+        }
 
         const wrapper = buildActionWrapper({
             pairId,
@@ -757,6 +871,13 @@ export async function postEventToSupervisor(params) {
             capturedAction: runtime.lastCapturedAction,
         });
         wrapper.turnId = turnId;
+        // A planning turn that emitted a plan but no closing tool is valid — don't
+        // surface the downgrade parseError; convert to a clean wait so the UI shows
+        // no spurious "no closing tool" card.
+        if (wrapper.parseError && runtime.lastCapturedPlan) {
+            wrapper.action = { action: 'wait', reason: 'plan emitted; awaiting first dispatch', payload: {} };
+            wrapper.parseError = null;
+        }
         // v3 side-channel data: only `usage` remains on the wrapper. tool_use
         // and compaction blocks now flow live via [SUPERVISOR_MSG] streaming so
         // the webview can render them as they happen (and so we no longer
