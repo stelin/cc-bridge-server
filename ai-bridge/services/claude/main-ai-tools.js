@@ -8,6 +8,7 @@
 import { loadClaudeSdk, loadZod } from '../../utils/sdk-loader.js';
 import { generateTurnId } from '../supervisor/protocol-v2.js';
 import { maybeSpill } from '../../utils/spill-to-file.js';
+import { buildQueryBugDetailsTool } from '../supervisor/yunxiao-tools.js';
 
 export const MAIN_MCP_NAME = 'main';
 export const REPORT_TURN_COMPLETION_TOOL_NAME = 'report_turn_completion';
@@ -45,6 +46,26 @@ export async function buildMainAiMcpServer(runtimeRef) {
   const z = zod?.z ?? zod?.default?.z ?? zod;
   if (typeof sdk?.createSdkMcpServer !== 'function' || typeof sdk?.tool !== 'function') {
     throw new Error('Claude SDK does not expose createSdkMcpServer/tool');
+  }
+
+  const tools = [];
+
+  // query_bug_details — 云效缺陷详情聚合工具。Available to the main AI in ALL modes
+  // (normal chat + Pair), so the user can ask it to pull a bug's full context
+  // directly. Credentials come from process.env.YUNXIAO_* (Java buildDaemonEnv).
+  try {
+    tools.push(buildQueryBugDetailsTool(sdk, zod));
+  } catch (e) {
+    console.error('[MAIN_AI_TOOLS] buildQueryBugDetailsTool failed:', e?.message || e);
+  }
+
+  // report_turn_completion — Pair mode only (needs a supervisor to report to).
+  if (!runtimeRef || !runtimeRef.pairId) {
+    return sdk.createSdkMcpServer({
+      name: MAIN_MCP_NAME,
+      version: '1.0.0',
+      tools,
+    });
   }
 
   const tool = sdk.tool(
@@ -95,10 +116,11 @@ export async function buildMainAiMcpServer(runtimeRef) {
       };
     }
   );
+  tools.push(tool);
 
   return sdk.createSdkMcpServer({
     name: MAIN_MCP_NAME,
     version: '1.0.0',
-    tools: [tool],
+    tools,
   });
 }

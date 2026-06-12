@@ -177,19 +177,19 @@ async function createRuntime(requestContext, callbacks) {
   }
   options.hooks = hooks;
 
-  // mcp__main MCP server (Pair mode only). report_turn_completion writes a
+  // mcp__main MCP server. Built in ALL modes so the main AI always has
+  // query_bug_details (云效缺陷详情); report_turn_completion is added by the builder
+  // only in Pair mode (it gates that tool on runtime.pairId) and writes a
   // [TURN_REPORT] NDJSON line that the Java EventBus consumes.
-  if (pairId) {
-    try {
-      const mainMcp = await buildMainAiMcpServer(runtime);
-      options.mcpServers = {
-        ...(options.mcpServers || {}),
-        [MAIN_MCP_NAME]: mainMcp,
-      };
-    } catch (err) {
-      console.error('[LIFECYCLE] buildMainAiMcpServer failed (Pair mode degraded, '
-        + 'report_turn_completion will be unavailable):', err?.message || err);
-    }
+  try {
+    const mainMcp = await buildMainAiMcpServer(runtime);
+    options.mcpServers = {
+      ...(options.mcpServers || {}),
+      [MAIN_MCP_NAME]: mainMcp,
+    };
+  } catch (err) {
+    console.error('[LIFECYCLE] buildMainAiMcpServer failed (query_bug_details'
+      + (pairId ? ' + report_turn_completion' : '') + ' unavailable):', err?.message || err);
   }
 
   runtime.query = queryFn({

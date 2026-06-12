@@ -61,6 +61,8 @@ export const SAFE_ALWAYS_ALLOW_TOOLS = new Set([
   'SendMessage',      // Send message to agent (agent has own permission checks)
   // Misc safe
   'Sleep',            // Sleep/wait tool
+  // 云效 bug detail — read-only data fetch (mounted on the main MCP server)
+  'mcp__main__query_bug_details',
 ]);
 
 // EDIT tools: auto-allowed in acceptEdits mode

@@ -1,22 +1,30 @@
 /**
- * Yunxiao (Alibaba Cloud DevOps / 云效) bug-detail tool for the supervisor MCP.
+ * Yunxiao (Alibaba Cloud DevOps / 云效) bug-detail tool for the supervisor + main-AI MCP servers.
  *
- * Exposes a single tool — `query_bug_details` — that aggregates a 云效 工作项's
- * 基础信息 + 所有评论 + 附件(含附件评论) in one call, so the缺陷监督者
- * (bug-supervisor) can pull full context before planning a fix.
+ * `query_bug_details` aggregates a 云效 工作项's 基础信息 + 所有评论 + 附件 AND downloads
+ * every embedded image (and every attachment) to a local tmp dir, returning the
+ * local paths so the AI can `Read` them (Read on an image = Claude vision). 云效
+ * embeds images behind a login-cookie web-console proxy
+ * (devops.aliyun.com/.../file/url?fileIdentifier=...) the AI can't fetch directly,
+ * so we resolve each fileIdentifier through the OpenAPI GetWorkitemFile endpoint
+ * (token auth) to a fresh signed OSS url and download that.
  *
- * Mounted onto the same `supervisor` MCP server as emit_action (see
- * channels/supervisor-channel.js). Credentials come from the daemon env
- * (process.env.YUNXIAO_TOKEN / YUNXIAO_ORG_ID / YUNXIAO_DOMAIN), injected by the
- * Java side via params.env → process.env. This file is byte-identical across the
- * two daemon copies (jetbrains-cc-gui/ai-bridge + ai-bridge-server/ai-bridge).
+ * Images are always downloaded; non-image attachments are downloaded too but only
+ * surfaced as paths (the AI Reads text-type files on demand). Downloads land in the
+ * DAEMON's tmp (os.tmpdir()/yunxiao-bugs/<bugId>/): local mode = the user's machine,
+ * remote mode = the ai-bridge-server — the same machine the AI's Read tool runs on,
+ * so Read always sees them. Left for the OS to clean. Limits: ≤8MB/file, ≤20 files,
+ * ≤50MB total per call.
  *
- * The three sub-requests run concurrently, each with its own retry/degradation:
- *   - 基础信息 (GetWorkitem)   — hard failure → the whole tool errors.
- *   - 评论 / 附件             — soft degradation → annotated as missing in payload.
- * Transient errors (timeout / 429 / 5xx) retry 3× with 200/400/800ms backoff;
- * deterministic errors (401/403/404) fail immediately.
+ * Mounted on both the `supervisor` and `main` MCP servers. Credentials come from the
+ * daemon env (process.env.YUNXIAO_TOKEN / YUNXIAO_ORG_ID / YUNXIAO_DOMAIN), injected
+ * by the Java side via params.env → process.env. byte-identical across the two
+ * daemon copies (jetbrains-cc-gui/ai-bridge + ai-bridge-server/ai-bridge).
  */
+
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 export const SUPERVISOR_MCP_NAME = 'supervisor';            // 与 supervisor-tools.js 一致
 export const QUERY_BUG_TOOL = 'query_bug_details';
@@ -24,6 +32,9 @@ export const QUALIFIED_QUERY_BUG = `mcp__${SUPERVISOR_MCP_NAME}__${QUERY_BUG_TOO
 
 const DEFAULT_DOMAIN = 'openapi-rdc.aliyuncs.com';
 const FETCH_TIMEOUT_MS = 15000;
+const MAX_FILES = 20;                       // 单次最多下载文件数
+const MAX_FILE_BYTES = 8 * 1024 * 1024;     // 单文件 ≤8MB
+const MAX_TOTAL_BYTES = 50 * 1024 * 1024;   // 总量 ≤50MB
 
 /**
  * Build the query_bug_details SDK tool. Accepts the resolved zod module (same
@@ -34,7 +45,8 @@ export function buildQueryBugDetailsTool(sdk, zod) {
   const z = zod?.z ?? zod?.default?.z ?? zod;
   return sdk.tool(
     QUERY_BUG_TOOL,
-    '查询云效缺陷的全部信息: 基础信息 + 所有评论 + 附件(含附件评论)。传入云效工作项 identifier。',
+    '查询云效缺陷的全部信息: 基础信息 + 所有评论 + 附件, 并把描述/评论里的所有截图和附件下载到本地临时目录(返回本地绝对路径)。' +
+    '⚠️ 修复缺陷前必须先用 Read 工具逐个查看返回的所有截图本地路径以理解实际画面, 否则你看不到截图里画了什么。传入云效工作项 identifier。',
     { bug_id: z.string().describe('云效工作项 identifier(非 serialNumber)') },
     async (args) => {
       const token = process.env.YUNXIAO_TOKEN;
@@ -58,30 +70,301 @@ export function buildQueryBugDetailsTool(sdk, zod) {
 
       // 三路并发, 每路独立重试/降级
       const [info, comments, files] = await Promise.all([
-        // 基础信息 (GetWorkitem): 已确认 path, 硬失败
-        fetchRetry(`${base}`, { headers: h }, { hard: true }),
-        // TODO(yunxiao): path 待 OpenAPI 调试台 pin —— 评论: 软降级
-        fetchRetry(`${base}/comments`, { headers: h }, { hard: false }),
-        // TODO(yunxiao): path 待 OpenAPI 调试台 pin —— 附件: 软降级
-        fetchRetry(`${base}/attachments`, { headers: h }, { hard: false }),
+        fetchRetry(`${base}`, { headers: h }, { hard: true }),                          // 基础信息: 硬失败
+        fetchRetry(`${base}/comments?page=1&perPage=50`, { headers: h }, { hard: false }), // 评论: 软降级
+        fetchRetry(`${base}/attachments`, { headers: h }, { hard: false }),             // 附件: 软降级
       ]);
       if (info.error) {
-        // A 404 on GetWorkitem almost always means a display serialNumber was passed
-        // instead of the internal identifier — tell the model how to recover.
         const hint = info.error.includes('404')
           ? `（「${bugId}」可能是显示编号 serialNumber 而非云效内部 identifier；请用缺陷列表项里的 identifier 重试）`
           : '';
         return { isError: true, content: [{ type: 'text', text: `基础信息获取失败: ${info.error}${hint}` }] };
       }
 
-      const payload = {
-        basic: info.data,
-        comments: comments.error ? `(评论获取失败: ${comments.error})` : comments.data,
-        attachments: files.error ? `(附件获取失败: ${files.error})` : files.data,
-      };
-      return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+      const workitem = unwrap(info.data);
+
+      // tmp 目录: daemon 本机 (本地模式=用户机器, 远程模式=ai-bridge-server)
+      const dir = join(tmpdir(), 'yunxiao-bugs', bugId.replace(/[^A-Za-z0-9_-]/g, '_'));
+      try { mkdirSync(dir, { recursive: true }); } catch (_) { /* best effort */ }
+
+      const budget = { count: 0, bytes: 0, notes: [] };
+      const downloaded = [];          // {path, kind:'image'|'file', label}
+      const seenFileId = {};          // fileId → local path (复用, 防重复下载)
+
+      // 1) 描述内嵌图
+      let descText = extractHtml(strOf(workitem, 'description'));
+      {
+        const map = {};
+        for (const fileId of collectFileIds(descText)) {
+          const p = await downloadByFileId(domain, orgId, bugId, fileId, token, dir, 'desc', budget, seenFileId);
+          if (p) { map[fileId] = p; downloaded.push({ path: p, kind: 'image', label: '描述内嵌图' }); }
+        }
+        descText = replaceImgRefs(descText, map);
+      }
+
+      // 2) 评论内嵌图
+      const commentList = asArray(comments.data);
+      const commentsOut = [];
+      for (let ci = 0; ci < commentList.length; ci++) {
+        const c = commentList[ci] || {};
+        const author = displayName(c.user) || displayName(c.creator) || displayName(c.author) || '?';
+        // content 可能是 字符串(JSON-wrapped htmlValue / html) 或 对象 {htmlValue,...}(新版 API)
+        let content = commentHtml(c);
+        const map = {};
+        for (const fileId of collectFileIds(content)) {
+          const p = await downloadByFileId(domain, orgId, bugId, fileId, token, dir, `comment-${ci + 1}`, budget, seenFileId);
+          if (p) { map[fileId] = p; downloaded.push({ path: p, kind: 'image', label: `评论(${author})内嵌图` }); }
+        }
+        content = replaceImgRefs(content, map);
+        commentsOut.push({ author, time: c.gmtCreate || c.createdAt || '', content });
+      }
+
+      // 3) 独立附件 (图片必下; 其它附件也下, 只给路径)
+      const attList = asArray(files.data);
+      const attachmentsOut = [];
+      for (const a of attList) {
+        const id = strOf(a, 'id');
+        const name = strOf(a, 'fileName') || strOf(a, 'name') || (id ? `attachment-${id}` : 'attachment');
+        if (!id) { attachmentsOut.push({ name, note: '无 id, 跳过' }); continue; }
+        const p = await downloadByFileId(domain, orgId, bugId, id, token, dir, 'att', budget, seenFileId, name);
+        if (p) {
+          const isImg = /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(p);
+          downloaded.push({ path: p, kind: isImg ? 'image' : 'file', label: `附件 ${name}` });
+          attachmentsOut.push({ name, localPath: p });
+        } else {
+          attachmentsOut.push({ name, note: '下载失败/超限' });
+        }
+      }
+
+      // ---- 组装返回文本 ----
+      const images = downloaded.filter((d) => d.kind === 'image');
+      const otherFiles = downloaded.filter((d) => d.kind !== 'image');
+      const out = [];
+      out.push('【基础信息】');
+      out.push(JSON.stringify(basicOf(workitem), null, 2));
+      out.push('');
+      out.push('【描述】');
+      out.push(descText || '(空)');
+      out.push('');
+      out.push(`【评论】(${commentsOut.length} 条)`);
+      for (const c of commentsOut) {
+        out.push(`— ${c.author}${c.time ? ' @' + c.time : ''}:`);
+        out.push(`  ${c.content || '(空)'}`);
+      }
+      if (comments.error) out.push(`(评论获取失败: ${comments.error})`);
+      out.push('');
+      out.push(`【已下载截图】${images.length} 张 ⚠️ 修复前必须用 Read 工具逐个查看, 否则看不到截图实际画面:`);
+      if (images.length === 0) out.push('  (无内嵌截图)');
+      for (const im of images) out.push(`- ${im.path}  (${im.label})`);
+      if (otherFiles.length) {
+        out.push('');
+        out.push(`【已下载附件】${otherFiles.length} 个 (按需用 Read 查看):`);
+        for (const f of otherFiles) out.push(`- ${f.path}  (${f.label})`);
+      }
+      if (files.error) out.push(`(附件列表获取失败: ${files.error})`);
+      if (budget.notes.length) {
+        out.push('');
+        out.push('【下载提示】' + budget.notes.join('; '));
+      }
+
+      return { content: [{ type: 'text', text: out.join('\n') }] };
     },
   );
+}
+
+// =============================================================================
+// 下载: fileId → OpenAPI GetWorkitemFile → OSS 签名 url → 字节 → 写 tmp
+// =============================================================================
+
+async function downloadByFileId(domain, orgId, bugId, fileId, token, dir, prefix, budget, seen, fileName) {
+  if (seen[fileId]) return seen[fileId];                 // 已下过(同 fileId 复用)
+  if (budget.count >= MAX_FILES) { note(budget, `已达 ${MAX_FILES} 个上限, 后续未下`); return null; }
+  if (budget.bytes >= MAX_TOTAL_BYTES) { note(budget, '已达总量上限, 后续未下'); return null; }
+  try {
+    const metaUrl = `https://${domain}/oapi/v1/projex/organizations/${orgId}/workitems/`
+      + `${encodeURIComponent(bugId)}/files/${encodeURIComponent(fileId)}`;
+    const meta = unwrap(await fetchJson(metaUrl, token));
+    const ossUrl = meta && meta.url;
+    const name = fileName || (meta && meta.name) || '';
+    if (!ossUrl) { note(budget, `${name || fileId} 未取到下载地址`); return null; }
+
+    const got = await fetchBytes(ossUrl);                // OSS 签名 url, 无需 token
+    if (!got) { note(budget, `${name || fileId} 下载失败`); return null; }
+    if (got.buf.length > MAX_FILE_BYTES) { note(budget, `${name || fileId} 超 8MB 未下`); return null; }
+    if (budget.bytes + got.buf.length > MAX_TOTAL_BYTES) { note(budget, `${name || fileId} 超总量未下`); return null; }
+
+    const idx = budget.count + 1;
+    const safe = (name || '').replace(/[^A-Za-z0-9._-]/g, '_');
+    const fname = (safe && /\.[A-Za-z0-9]+$/.test(safe))
+      ? `${idx}-${safe}`
+      : `${prefix}-${idx}${extOf(safe) || extFromCt(got.ct) || '.png'}`;
+    const p = join(dir, fname);
+    writeFileSync(p, got.buf);
+    budget.count++; budget.bytes += got.buf.length;
+    seen[fileId] = p;
+    return p;
+  } catch (e) {
+    note(budget, `${fileName || fileId} 下载异常: ${(e && e.message) || e}`);
+    return null;
+  }
+}
+
+async function fetchJson(url, token) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, {
+      headers: { 'x-yunxiao-token': token, 'Content-Type': 'application/json' },
+      signal: controller.signal,
+    });
+    clearTimeout(t);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (_) {
+    clearTimeout(t);
+    return null;
+  }
+}
+
+async function fetchBytes(url) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, { signal: controller.signal });
+    clearTimeout(t);
+    if (!r.ok) return null;
+    const ab = await r.arrayBuffer();
+    return { buf: Buffer.from(ab), ct: r.headers.get('content-type') || '' };
+  } catch (_) {
+    clearTimeout(t);
+    return null;
+  }
+}
+
+// =============================================================================
+// helpers
+// =============================================================================
+
+function note(budget, msg) { if (budget.notes.length < 10) budget.notes.push(msg); }
+
+function unwrap(o) {
+  if (!o || typeof o !== 'object') return o;
+  if (o.result && typeof o.result === 'object' && !Array.isArray(o.result)) return o.result;
+  if (o.data && typeof o.data === 'object' && !Array.isArray(o.data)
+      && !('url' in o) && !('subject' in o)) return o.data;
+  return o;
+}
+
+function asArray(d) {
+  if (Array.isArray(d)) return d;
+  if (d && Array.isArray(d.result)) return d.result;
+  if (d && Array.isArray(d.data)) return d.data;
+  if (d && Array.isArray(d.items)) return d.items;
+  return [];
+}
+
+function strOf(o, k) {
+  const v = o && o[k];
+  return (v != null && typeof v !== 'object') ? String(v) : '';
+}
+
+function displayName(u) {
+  if (!u) return '';
+  if (typeof u === 'string') return u;
+  return u.displayName || u.name || u.nickName || '';
+}
+
+/** 云效富文本 description 常是 {"htmlValue":"<html>","jsonMLValue":[...]} JSON 串; 解出 html。 */
+function extractHtml(s) {
+  if (!s || typeof s !== 'string') return s || '';
+  const t = s.trim();
+  if (t.startsWith('{') && t.endsWith('}')) {
+    try {
+      const o = JSON.parse(t);
+      for (const k of ['htmlValue', 'html', 'value', 'content']) {
+        if (typeof o[k] === 'string' && o[k]) return o[k];
+      }
+    } catch (_) { /* not the wrapper json — treat as plain html */ }
+  }
+  return s;
+}
+
+/** Comment content tolerant of 云效 variations: string(JSON/html) or object {htmlValue}. */
+function commentHtml(c) {
+  if (!c) return '';
+  const el = c.content;
+  if (typeof el === 'string') {
+    return extractHtml(el);                                  // handles JSON-wrapped {htmlValue}
+  }
+  if (el && typeof el === 'object') {
+    for (const k of ['htmlValue', 'html', 'value', 'content', 'text']) {
+      if (typeof el[k] === 'string' && el[k]) return el[k];
+    }
+  }
+  if (typeof c.htmlValue === 'string' && c.htmlValue) return c.htmlValue;
+  for (const k of ['text', 'description', 'body']) {
+    if (typeof c[k] === 'string' && c[k]) return c[k];
+  }
+  return '';
+}
+
+function collectFileIds(html) {
+  if (!html) return [];
+  const re = /fileIdentifier=([A-Za-z0-9_-]+)/g;
+  const out = [];
+  const seen = new Set();
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    if (!seen.has(m[1])) { seen.add(m[1]); out.push(m[1]); }
+  }
+  return out;
+}
+
+/** Replace each <img .. fileIdentifier=X ..> / ![..](..X..) with a "Read this file" marker. */
+function replaceImgRefs(html, fileIdToPath) {
+  if (!html) return html;
+  let out = html;
+  for (const [fileId, path] of Object.entries(fileIdToPath || {})) {
+    const e = escapeRe(fileId);
+    const marker = `【截图,已下载→用 Read 查看: ${path}】`;
+    out = out
+      .replace(new RegExp('<img[^>]*' + e + '[^>]*>', 'gi'), marker)
+      .replace(new RegExp('!\\[[^\\]]*\\]\\([^)]*' + e + '[^)]*\\)', 'g'), marker);
+  }
+  return out;
+}
+
+function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+function extOf(name) {
+  const m = /(\.[A-Za-z0-9]+)$/.exec(name || '');
+  return m ? m[1].toLowerCase() : '';
+}
+
+function extFromCt(ct) {
+  const c = (ct || '').toLowerCase();
+  if (c.includes('png')) return '.png';
+  if (c.includes('jpeg') || c.includes('jpg')) return '.jpg';
+  if (c.includes('gif')) return '.gif';
+  if (c.includes('webp')) return '.webp';
+  if (c.includes('bmp')) return '.bmp';
+  if (c.includes('svg')) return '.svg';
+  return '';
+}
+
+function basicOf(d) {
+  if (!d || typeof d !== 'object') return d;
+  return {
+    identifier: d.identifier || d.id,
+    serialNumber: d.serialNumber,
+    subject: d.subject,
+    status: displayName(d.status) || d.status,
+    assignedTo: displayName(d.assignedTo),
+    creator: displayName(d.creator),
+    priority: displayName(d.priority),
+    gmtCreate: d.gmtCreate,
+    gmtModified: d.gmtModified,
+  };
 }
 
 /**
