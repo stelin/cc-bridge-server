@@ -40,7 +40,7 @@ import {
     DISPATCH_TO_MAIN_AI_TOOL_NAME,
     RETRY_MAIN_AI_WITH_HINT_TOOL_NAME,
 } from '../services/supervisor/supervisor-tools.js';
-import { buildQueryBugDetailsTool, QUALIFIED_QUERY_BUG } from '../services/supervisor/yunxiao-tools.js';
+import { buildQueryBugDetailsTool, QUALIFIED_QUERY_BUG, buildReportBugFixTool, QUALIFIED_REPORT_FIX } from '../services/supervisor/yunxiao-tools.js';
 import { buildPreCompactHook } from '../services/supervisor/pre-compact-hook.js';
 import { PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from '../services/supervisor/protocol-v2.js';
 // 2026-06-01: MCP self-check for test/bug supervisors. Reused as-is from the
@@ -600,7 +600,7 @@ export async function startSupervisorSession(params) {
         onCaptureGuarded,
         { pairId: runtime.pairId, supervisorId: runtime.supervisorId },
         onCapturePlan,
-        [buildQueryBugDetailsTool(sdk, zod)]
+        [buildQueryBugDetailsTool(sdk, zod), buildReportBugFixTool(sdk, zod)]
     );
 
     // Allow emit_action + dispatch_to_main_ai + retry_main_ai_with_hint +
@@ -617,6 +617,7 @@ export async function startSupervisorSession(params) {
         QUALIFIED_UPDATE_STATE,
         QUALIFIED_EMIT_PLAN,
         QUALIFIED_QUERY_BUG,
+        QUALIFIED_REPORT_FIX,
         ...SUPERVISOR_READ_TOOLS,
         ...SUPERVISOR_AGENT_TOOLS,
         ...runtime.allowedTools,
@@ -686,6 +687,9 @@ export async function startSupervisorSession(params) {
                     return { behavior: 'allow' };
                 }
                 if (toolName === QUALIFIED_QUERY_BUG) {
+                    return { behavior: 'allow' };
+                }
+                if (toolName === QUALIFIED_REPORT_FIX) {
                     return { behavior: 'allow' };
                 }
                 if (SUPERVISOR_READ_TOOLS.includes(toolName)) {

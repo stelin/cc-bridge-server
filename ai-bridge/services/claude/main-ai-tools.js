@@ -8,7 +8,7 @@
 import { loadClaudeSdk, loadZod } from '../../utils/sdk-loader.js';
 import { generateTurnId } from '../supervisor/protocol-v2.js';
 import { maybeSpill } from '../../utils/spill-to-file.js';
-import { buildQueryBugDetailsTool } from '../supervisor/yunxiao-tools.js';
+import { buildQueryBugDetailsTool, buildReportBugFixTool } from '../supervisor/yunxiao-tools.js';
 
 export const MAIN_MCP_NAME = 'main';
 export const REPORT_TURN_COMPLETION_TOOL_NAME = 'report_turn_completion';
@@ -57,6 +57,14 @@ export async function buildMainAiMcpServer(runtimeRef) {
     tools.push(buildQueryBugDetailsTool(sdk, zod));
   } catch (e) {
     console.error('[MAIN_AI_TOOLS] buildQueryBugDetailsTool failed:', e?.message || e);
+  }
+
+  // comment_bug_fix — 把修复结论(原因/修复/测试)评论回云效缺陷。All modes; auto-allowed
+  // in permission-handler (write op the user authorized via the fix prompt).
+  try {
+    tools.push(buildReportBugFixTool(sdk, zod));
+  } catch (e) {
+    console.error('[MAIN_AI_TOOLS] buildReportBugFixTool failed:', e?.message || e);
   }
 
   // report_turn_completion — Pair mode only (needs a supervisor to report to).

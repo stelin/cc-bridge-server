@@ -29,6 +29,8 @@ import { join } from 'node:path';
 export const SUPERVISOR_MCP_NAME = 'supervisor';            // 与 supervisor-tools.js 一致
 export const QUERY_BUG_TOOL = 'query_bug_details';
 export const QUALIFIED_QUERY_BUG = `mcp__${SUPERVISOR_MCP_NAME}__${QUERY_BUG_TOOL}`;
+export const REPORT_FIX_TOOL = 'comment_bug_fix';
+export const QUALIFIED_REPORT_FIX = `mcp__${SUPERVISOR_MCP_NAME}__${REPORT_FIX_TOOL}`;
 
 const DEFAULT_DOMAIN = 'openapi-rdc.aliyuncs.com';
 const FETCH_TIMEOUT_MS = 15000;
@@ -170,6 +172,84 @@ export function buildQueryBugDetailsTool(sdk, zod) {
       return { content: [{ type: 'text', text: out.join('\n') }] };
     },
   );
+}
+
+/**
+ * Build the comment_bug_fix SDK tool. Posts the fix conclusion (cause / fix / test —
+ * three mandatory sections) as a comment on the 云效 工作项. Same env + endpoint family
+ * as query_bug_details. Single attempt (no retry) to avoid double-posting on a timeout.
+ */
+export function buildReportBugFixTool(sdk, zod) {
+  const z = zod?.z ?? zod?.default?.z ?? zod;
+  return sdk.tool(
+    REPORT_FIX_TOOL,
+    '把缺陷的修复结论作为评论发布到云效缺陷下(修复并通过验证后调用一次)。必须提供三段:缺陷产生的原因、如何修复、如何测试。bug_id 传云效工作项 identifier(非 serialNumber)。',
+    {
+      bug_id: z.string().describe('云效工作项 identifier(非 serialNumber)'),
+      cause: z.string().describe('缺陷产生的原因(根因)'),
+      fix: z.string().describe('如何修复的(改了什么/采用的方案)'),
+      test: z.string().describe('如何测试/验证(复现步骤或验证证据)'),
+    },
+    async (args) => {
+      const token = process.env.YUNXIAO_TOKEN;
+      const orgId = process.env.YUNXIAO_ORG_ID;
+      const domain = process.env.YUNXIAO_DOMAIN || DEFAULT_DOMAIN;
+      if (!token || !orgId) {
+        return { isError: true, content: [{ type: 'text', text: '云效未配置 token/organizationId' }] };
+      }
+      const bugId = (args.bug_id || '').trim();
+      const cause = (args.cause || '').trim();
+      const fix = (args.fix || '').trim();
+      const test = (args.test || '').trim();
+      if (!bugId) {
+        return { isError: true, content: [{ type: 'text', text: '未提供 bug id:需要云效工作项内部 identifier(非显示编号 BUG-xxx)。' }] };
+      }
+      if (!cause || !fix || !test) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: '修复结论必须同时含三段:cause(原因)、fix(修复)、test(测试),请补全后重试。' }],
+        };
+      }
+      const content =
+        '## ✅ 缺陷修复结论(AI 自动生成)\n\n' +
+        '**一、缺陷产生的原因**\n' + cause + '\n\n' +
+        '**二、如何修复**\n' + fix + '\n\n' +
+        '**三、如何测试**\n' + test + '\n';
+      const url = `https://${domain}/oapi/v1/projex/organizations/${orgId}/workitems/${encodeURIComponent(bugId)}/comments`;
+      const res = await postJson(url, token, { content });
+      if (!res.ok) {
+        const hint = (res.error || '').includes('404')
+          ? `(「${bugId}」可能是 serialNumber 而非云效内部 identifier;请用列表项的 identifier 重试)`
+          : '';
+        return { isError: true, content: [{ type: 'text', text: `评论发布失败: ${res.error}${hint}` }] };
+      }
+      return { content: [{ type: 'text', text: `已把修复结论(原因/修复/测试 三段)评论到云效缺陷 ${bugId}。` }] };
+    },
+  );
+}
+
+/** POST JSON with the 云效 token. Single attempt (write op — avoid double-posting on retry). */
+async function postJson(url, token, body) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'x-yunxiao-token': token, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    clearTimeout(t);
+    if (!r.ok) {
+      let detail = '';
+      try { detail = ((await r.text()) || '').slice(0, 300); } catch (_) { /* ignore */ }
+      return { ok: false, error: `HTTP ${r.status}${detail ? ': ' + detail : ''}` };
+    }
+    return { ok: true };
+  } catch (e) {
+    clearTimeout(t);
+    return { ok: false, error: (e && e.name === 'AbortError') ? 'timeout' : ((e && e.message) || String(e)) };
+  }
 }
 
 // =============================================================================

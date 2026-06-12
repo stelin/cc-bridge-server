@@ -63,6 +63,9 @@ export const SAFE_ALWAYS_ALLOW_TOOLS = new Set([
   'Sleep',            // Sleep/wait tool
   // 云效 bug detail — read-only data fetch (mounted on the main MCP server)
   'mcp__main__query_bug_details',
+  // 云效 修复结论评论 — a WRITE, intentionally auto-allowed: the user authorizes it via
+  // the "fix then comment" prompt; it posts a fix-summary comment to the bug.
+  'mcp__main__comment_bug_fix',
 ]);
 
 // EDIT tools: auto-allowed in acceptEdits mode
