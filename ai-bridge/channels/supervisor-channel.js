@@ -66,6 +66,33 @@ function isTransientApiError(text) {
     return /API Error:|empty or malformed response|proxy or gateway intercepting/i.test(text);
 }
 
+// L1 self-heal (2026-06-26): the SDK injects a synthetic error tool_result with
+// content like "Your tool call was malformed and could not be parsed. Please
+// retry." when a closing tool's input JSON is unparseable — typically the
+// supervisor's dispatch_to_main_ai/emit_action tool_use was truncated mid-JSON
+// (a long post-resume "recap + big dispatch" turn hitting the model's output
+// limit). Because the closing MCP tools are filtered out of pendingTools (see
+// collectAssistantTurn), this error was previously dropped on the floor and the
+// turn silently downgraded to `wait` — a permanent wedge (the supervisor never
+// learns its dispatch failed, so it neither dispatches nor advances). We detect
+// the signal so the turn loop can re-prompt with a "use a SHORTER prompt" hint,
+// and Java can tell a genuine malformed failure apart from a hallucinated wait.
+// Deliberately NOT a bare is_error check — a normal failing Read/Grep (ENOENT,
+// etc.) also sets is_error and must NOT trip this path.
+export function isMalformedToolResult(block) {
+    if (!block || block.is_error !== true) return false;
+    let text = '';
+    if (typeof block.content === 'string') {
+        text = block.content;
+    } else if (Array.isArray(block.content)) {
+        text = block.content
+            .filter((c) => c?.type === 'text' && typeof c.text === 'string')
+            .map((c) => c.text)
+            .join('\n');
+    }
+    return /could not be parsed|was malformed|malformed (tool|json|function)|invalid tool input/i.test(text);
+}
+
 // v3: read-only file tools granted to the supervisor so it can perform
 // in-turn review (Glob to locate produced files, Read to inspect contents,
 // Grep to flag TODO/FIXME/stub functions). Write/Edit/Bash remain forbidden
@@ -826,19 +853,33 @@ export async function postEventToSupervisor(params) {
 
         let turn = await collectAssistantTurn(runtime);
 
-        // Transient API-error retry: an empty/malformed HTTP 200 from the model
-        // endpoint surfaces as "API Error: ..." assistant text with no captured
-        // action/plan. Re-prompt up to MAX_TURN_RETRIES before falling through to
-        // the downgrade — mirrors the main AI's AUTO_RETRY so a proxy/gateway blip
-        // doesn't show a raw error or stall the supervisor.
+        // Self-heal retry: re-prompt up to MAX_TURN_RETRIES when the turn captured
+        // no action/plan AND the cause looks recoverable —
+        //   (a) transient API/gateway blip: an empty/malformed HTTP 200 surfaces as
+        //       "API Error: ..." assistant text (mirrors the main AI's AUTO_RETRY); or
+        //   (b) L1 (2026-06-26): the closing tool call came back malformed /
+        //       "could not be parsed" — almost always a dispatch_to_main_ai whose
+        //       prompt was so long the tool_use JSON truncated mid-field. A tailored
+        //       "use a SHORTER prompt" re-prompt steers the model off the truncation
+        //       cliff instead of silently downgrading to `wait` and wedging the pair.
         for (let attempt = 1;
              attempt <= MAX_TURN_RETRIES
                  && !runtime.lastCapturedAction && !runtime.lastCapturedPlan
-                 && isTransientApiError(turn.assistantText);
+                 && (isTransientApiError(turn.assistantText) || turn.toolMalformed);
              attempt++) {
+            const malformed = !!turn.toolMalformed;
+            const retryText = malformed
+                ? '上一次的收尾工具调用被判为畸形/无法解析 —— 通常是 dispatch_to_main_ai 的 prompt 过长、'
+                  + 'tool_use 的 JSON 在中途被截断。请**重新调用收尾工具，并把指令写得短得多**：'
+                  + '用一两句话点明目标 + 引用计划步号/验收标准，不要把整步内容重述进 prompt（主 AI 已能看到计划）；'
+                  + '指令很长时拆成多次 dispatch_to_main_ai。不要 emit wait。'
+                : '上一次响应为空或异常（API/网关返回空 200）。请忽略该错误，重新对上面的事件做出决策并调用相应工具收尾。';
             console.error(
-                `[supervisor] transient API error (retry ${attempt}/${MAX_TURN_RETRIES}) `
-                + `pair=${pairId}: ${(turn.assistantText || '').slice(0, 140).replace(/\n/g, ' ')}`
+                `[supervisor] ${malformed ? 'malformed-tool' : 'transient-api'} retry `
+                + `(${attempt}/${MAX_TURN_RETRIES}) pair=${pairId}`
+                + (malformed
+                    ? ` tool=${turn.malformedToolName || '?'}`
+                    : `: ${(turn.assistantText || '').slice(0, 140).replace(/\n/g, ' ')}`)
             );
             await new Promise((r) => setTimeout(r, RETRY_BASE_DELAY_MS * attempt));
             if (runtime.disposed) break;
@@ -848,7 +889,7 @@ export async function postEventToSupervisor(params) {
                 parent_tool_use_id: null,
                 message: {
                     role: 'user',
-                    content: [{ type: 'text', text: '上一次响应为空或异常（API/网关返回空 200）。请忽略该错误，重新对上面的事件做出决策并调用相应工具收尾。' }],
+                    content: [{ type: 'text', text: retryText }],
                 },
             });
             turn = await collectAssistantTurn(runtime);
@@ -879,6 +920,7 @@ export async function postEventToSupervisor(params) {
             assistantText: turn.assistantText,
             reasoningText: turn.reasoningText,
             capturedAction: runtime.lastCapturedAction,
+            toolMalformed: turn.toolMalformed,
         });
         wrapper.turnId = turnId;
         // A planning turn that emitted a plan but no closing tool is valid — don't
@@ -1357,6 +1399,12 @@ async function collectAssistantTurn(runtime) {
     let lastFrameMs = turnStartMs;
     let prevFrameKind = 'init'; // init | tool_use | compact | text | result | other
     let lastToolUseName = null;
+    // L1 self-heal: set when the SDK reports a closing tool call as malformed /
+    // unparseable (see isMalformedToolResult). Surfaced on the returned turn so
+    // the postEvent loop can re-prompt with a "shorter prompt" hint instead of
+    // silently downgrading to wait.
+    let sawMalformedToolResult = false;
+    let malformedToolName = null;
     // Live output-token estimate (2026-05-28): streamed chars (text + thinking)
     // + last-emit timestamp for throttling + authoritative running output from
     // message_delta. Drives the supervisor pane's live "↓ N tokens".
@@ -1539,6 +1587,17 @@ async function collectAssistantTurn(runtime) {
             for (const block of msg.message.content) {
                 if (!block || typeof block !== 'object') continue;
                 if (block.type !== 'tool_result') continue;
+                // L1 self-heal: catch the SDK's "malformed / could not be parsed"
+                // error for a closing tool (which is filtered out of pendingTools,
+                // so it would otherwise be ignored by the `!pending` guard below).
+                if (isMalformedToolResult(block)) {
+                    sawMalformedToolResult = true;
+                    if (lastToolUseName) malformedToolName = lastToolUseName;
+                    console.error(
+                        `[supervisor-diag] MALFORMED tool_result detected pair=${runtime.pairId} `
+                        + `tool=${malformedToolName || '?'} — will re-prompt (L1 self-heal)`
+                    );
+                }
                 const pending = pendingTools.get(block.tool_use_id);
                 if (!pending) continue;
                 pending.result = summarizeToolResult(block);
@@ -1616,6 +1675,9 @@ async function collectAssistantTurn(runtime) {
         toolEvents,
         compactEvents,
         usage: lastUsage ? normaliseUsage(lastUsage) : null,
+        // L1 self-heal: did a closing tool call come back malformed/unparseable?
+        toolMalformed: sawMalformedToolResult,
+        malformedToolName,
     };
 }
 
@@ -1771,7 +1833,7 @@ function normaliseUsage(usage) {
  * model's prose for debugging — it never reaches the bubble (the streamed
  * text entries already did).
  */
-function buildActionWrapper({ pairId, supervisorId, assistantText, reasoningText, capturedAction }) {
+export function buildActionWrapper({ pairId, supervisorId, assistantText, reasoningText, capturedAction, toolMalformed }) {
     if (capturedAction) {
         // Protocol v2 (2026-05-24): surface directiveId at the wrapper top so
         // Java's ActionRouter + DirectiveTracker can correlate without diving
@@ -1790,6 +1852,11 @@ function buildActionWrapper({ pairId, supervisorId, assistantText, reasoningText
         };
     }
 
+    // No closing tool captured. Distinguish a genuine malformed/truncated tool
+    // call (recoverable — Java re-prompts with a corrective system message so the
+    // supervisor re-dispatches a SHORTER prompt next turn) from a plain "the model
+    // just didn't call a tool", so the wait-guard does not mislabel a truncated
+    // dispatch as a hallucinated wait and escalate it toward the deadlock takeover.
     return {
         pairId,
         supervisorId,
@@ -1797,11 +1864,13 @@ function buildActionWrapper({ pairId, supervisorId, assistantText, reasoningText
         reasoningText: '',
         action: {
             action: 'wait',
-            reason: '(downgraded) supervisor did not call emit_action this turn',
+            reason: toolMalformed
+                ? '(downgraded) closing tool call was malformed / could not be parsed (likely truncated — prompt too long)'
+                : '(downgraded) supervisor did not call emit_action this turn',
             payload: {},
         },
         directiveId: null,
-        parseError: 'no_tool_use',
+        parseError: toolMalformed ? 'tool_malformed' : 'no_tool_use',
         rawText: assistantText,
     };
 }

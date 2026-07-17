@@ -18,14 +18,28 @@ export function mapModelIdToSdkName(modelId) {
   // Mapping rules:
   // - Contains 'opus' -> 'opus'
   // - Contains 'haiku' -> 'haiku'
-  // - Otherwise (contains 'sonnet' or unknown) -> 'sonnet'
+  // - Contains 'sonnet' -> 'sonnet'
   if (lowerModel.includes('opus')) {
     return 'opus';
   } else if (lowerModel.includes('haiku')) {
     return 'haiku';
-  } else {
+  } else if (lowerModel.includes('sonnet')) {
     return 'sonnet';
   }
+
+  // First-party Claude models that don't map to an opus/sonnet/haiku tier alias
+  // (e.g. Fable 5 'claude-fable-5', Mythos 5) must be passed through verbatim as
+  // the SDK model. Collapsing them to the 'sonnet' alias makes the SDK resolve
+  // 'sonnet' to the latest Sonnet (claude-sonnet-5) and ignore the concrete
+  // model, so a Fable 5 selection silently ran as Sonnet 5. The [1m] suffix is
+  // preserved so 1M context still applies (parsed from the model string).
+  if (lowerModel.startsWith('claude-') || lowerModel.startsWith('claude_')) {
+    return modelId;
+  }
+
+  // Non-Anthropic model names (e.g. MiniMax-M2.5, glm-4.6) keep using the
+  // 'sonnet' alias + ANTHROPIC_DEFAULT_SONNET_MODEL mapping used by unified proxies.
+  return 'sonnet';
 }
 
 /**

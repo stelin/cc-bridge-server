@@ -374,6 +374,8 @@ function buildNextStepDispatchLines(ns) {
     '## [DISPATCH_NEXT_STEP] 上一步已通过——请派发下一步（不要 wait）',
     `计划尚未完成：${label} **尚未派发**，且当前没有在途的主 AI 任务。`,
     '**本轮必须用 `dispatch_to_main_ai` 派发它**（带 objective + acceptanceCriteria），不要 emit_action(wait)。',
+    '**派发指令(prompt)要短**：一两句话点明这一步要做什么 + 引用步号/验收标准即可，不要把整步内容大段重述进 prompt'
+      + '（主 AI 已能看到计划与验收标准）。prompt 过长会让本轮工具调用的 JSON 被截断、派发失败。',
     '这是"首次派单(dispatch)"而非"推进(advance)"——它从未派发过，不需要也等不到它的 turn_report 才派。',
   ];
   if (Array.isArray(ns.acceptanceCriteria) && ns.acceptanceCriteria.length > 0) {

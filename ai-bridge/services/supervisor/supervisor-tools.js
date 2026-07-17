@@ -289,7 +289,11 @@ function buildDispatchToMainAiSchema(z) {
             'REQUIRED. The instruction text that will be injected as the main AI\'s '
             + 'next user message. Must be >= 10 chars. Write a direct instruction the '
             + 'main AI can act on — for ping/echo tests, write the exact reply text '
-            + 'you want back. The main AI sees this verbatim; it does NOT see reason / objective.'
+            + 'you want back. The main AI sees this verbatim; it does NOT see reason / objective. '
+            + 'KEEP IT CONCISE: a couple of sentences naming the goal, plus the step number / '
+            + 'acceptance criteria — do NOT paste the whole plan step back in (the main AI already '
+            + 'has the plan). An over-long prompt risks truncating this tool call\'s JSON; put bulky '
+            + 'detail in acceptanceCriteria/expectedDeliverables or split into multiple dispatches.'
         ),
         reason: z.string().optional().describe(
             'Short rationale (1-2 sentences) for UI/log only. The main AI does NOT see this.'

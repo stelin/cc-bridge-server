@@ -93,6 +93,48 @@ function resolveStreamingEnabled(params, settings) {
     : (settings?.streamingEnabled ?? false);
 }
 
+// ---------------------------------------------------------------------------
+// Background-task "keep the turn open" support (2026-07-13)
+//
+// ultracode Workflows (and any run_in_background task) settle AFTER the turn's
+// `result`. Empirically (SDK 0.3.198) the SDK wakes the session on its own when
+// such a task settles: it emits `task_notification` + a full follow-up turn on
+// the SAME query iterator, with no extra input from us. The old loop broke on
+// the first `result`, so everything after it (the workflow's completion + the
+// model's follow-up) was never drained — the chat only ever saw the "I'll wait
+// for the workflow" turn and then went silent. Fix: keep draining past an
+// intermediate `result` while any background task is still in flight.
+//
+// In-flight tracking, from the `system/task_*` stream messages:
+//   task_started            -> add(task_id)
+//   task_notification       -> delete(task_id)   (settled: completed/failed/stopped)
+//   task_updated {terminal} -> delete(task_id)   (completed/failed/killed)
+// A foreground subagent settles (task_notification + terminal task_updated)
+// BEFORE its own turn's `result`, so a normal turn's set is empty at `result`:
+// no added latency, and no risk of hanging a plain turn.
+const TERMINAL_TASK_STATUSES = new Set(['completed', 'failed', 'killed', 'stopped']);
+
+function trackBackgroundTask(pending, msg) {
+  if (msg?.type !== 'system' || !msg.task_id) return;
+  if (msg.subtype === 'task_started') {
+    pending.add(msg.task_id);
+  } else if (msg.subtype === 'task_notification') {
+    pending.delete(msg.task_id);
+  } else if (msg.subtype === 'task_updated' && TERMINAL_TASK_STATUSES.has(msg.patch?.status)) {
+    pending.delete(msg.task_id);
+  }
+}
+
+// Backstop: if we're parked waiting for a background task and the stream goes
+// silent for this long, stop waiting so the UI is never locked forever. A real
+// workflow emits task_progress far more often than this, so it never trips; the
+// Stop button (abort -> disposeRuntime) is the primary escape hatch. Override
+// with AI_BRIDGE_WORKFLOW_SILENCE_MS.
+const WORKFLOW_SILENCE_TIMEOUT_MS = (() => {
+  const raw = parseInt(process.env.AI_BRIDGE_WORKFLOW_SILENCE_MS || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15 * 60 * 1000;
+})();
+
 /**
  * Protocol v2 (2026-05-24): Pair-mode system prompt append. Inlined from
  * `jetbrains-cc-gui/src/main/resources/main-ai-system-prompt-append.md`.
@@ -451,6 +493,30 @@ async function executeTurn(runtime, requestContext, turnMeta) {
     turnMeta.state = turnState;
   }
 
+  // Background-task "keep the turn open" state (see helpers above). While any
+  // background task (ultracode Workflow / run_in_background) is in flight, an
+  // incoming `result` is NOT the end of the turn — we keep draining so the
+  // completion notification + follow-up turn reach the UI.
+  const pendingBackgroundTasks = new Set();
+  let silenceTimer = null;
+  const clearSilenceWatchdog = () => {
+    if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+  };
+  const rearmSilenceWatchdog = () => {
+    clearSilenceWatchdog();
+    if (pendingBackgroundTasks.size === 0) return;
+    silenceTimer = setTimeout(() => {
+      silenceTimer = null;
+      console.error('[WORKFLOW_WAIT_TIMEOUT] ' + JSON.stringify({
+        pending: Array.from(pendingBackgroundTasks),
+        silenceMs: WORKFLOW_SILENCE_TIMEOUT_MS,
+      }));
+      // Close the query so the parked query.next() unwinds and the turn ends.
+      disposeRuntime(runtime, { removeSession }).catch(() => {});
+    }, WORKFLOW_SILENCE_TIMEOUT_MS);
+    silenceTimer.unref?.();
+  };
+
   try {
     beginRuntimeTurn(runtime);
     console.log('[MESSAGE_START]');
@@ -483,6 +549,20 @@ async function executeTurn(runtime, requestContext, turnMeta) {
       if (msg?.type === 'stream_event' && turnState.streamingEnabled) {
         turnState.hasStreamEvents = true;
         processStreamEvent(msg, turnState);
+        continue;
+      }
+
+      // Update in-flight background-task bookkeeping, then (re)arm the silence
+      // backstop while anything is still outstanding.
+      trackBackgroundTask(pendingBackgroundTasks, msg);
+      rearmSilenceWatchdog();
+
+      // An intermediate `result` — the turn "ended" but a background task is
+      // still running. Do NOT forward it (the client would finalize the turn)
+      // and do NOT break: the SDK re-invokes the model when the task settles, so
+      // we keep draining and the follow-up turn + its own final `result` arrive.
+      if (msg?.type === 'result' && !msg.is_error && pendingBackgroundTasks.size > 0) {
+        console.error('[WORKFLOW_WAIT] ' + JSON.stringify({ pending: pendingBackgroundTasks.size }));
         continue;
       }
 
@@ -550,6 +630,7 @@ async function executeTurn(runtime, requestContext, turnMeta) {
       sessionId: finalSessionId
     }));
   } finally {
+    clearSilenceWatchdog();
     endRuntimeTurn(runtime);
     // Only clear if this runtime still owns the pointer (not cleared by abort)
     clearActiveTurnRuntimeIf(runtime);
